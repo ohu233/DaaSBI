@@ -22,6 +22,8 @@ import numpy as np
 6. 额外成表：输出字段为：trajectory_id，time_diff，space_diff，表命名为time_space_diff
 
 '''
+
+'''
 # ----------------------------
 # 投影与网格参数（当前：三省一市）
 # ----------------------------
@@ -44,7 +46,7 @@ proj_schema = StructType([
     StructField("x", DoubleType(), True),
     StructField("y", DoubleType(), True)
 ])
-
+'''
 # =========================================================
 
 class HiveTable:
@@ -57,7 +59,7 @@ class HiveTable:
         )
         session.sql(f"USE {db}")
         self.__session = session
-
+        '''
         @pandas_udf(DoubleType(), PandasUDFType.SCALAR)
         def proj_x(lon, lat):
             lon_s = pd.to_numeric(lon, errors="coerce")
@@ -84,7 +86,7 @@ class HiveTable:
 
         self.proj_x = proj_x
         self.proj_y = proj_y
-
+        '''
     def stop(self):
         self.__session.stop()
 
@@ -127,19 +129,7 @@ class HiveTable:
                     ROW_NUMBER() OVER (PARTITION BY uid, date ORDER BY stime) AS index,
                     LEAD(stime) OVER (PARTITION BY uid, date ORDER BY stime) AS next_stime,
                     LEAD(lat)   OVER (PARTITION BY uid, date ORDER BY stime) AS next_lat,
-                    LEAD(lon)   OVER (PARTITION BY uid, date ORDER BY stime) AS next_lon,
-                    FIRST_VALUE(stime) OVER (PARTITION BY uid, date ORDER BY stime
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_stime,
-                    LAST_VALUE(stime)  OVER (PARTITION BY uid, date ORDER BY stime
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_stime,
-                    FIRST_VALUE(lat)   OVER (PARTITION BY uid, date ORDER BY stime
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_lat,
-                    FIRST_VALUE(lon)   OVER (PARTITION BY uid, date ORDER BY stime
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_lon,
-                    LAST_VALUE(lat)    OVER (PARTITION BY uid, date ORDER BY stime
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_lat,
-                    LAST_VALUE(lon)    OVER (PARTITION BY uid, date ORDER BY stime
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_lon
+                    LEAD(lon)   OVER (PARTITION BY uid, date ORDER BY stime) AS next_lon
                 FROM joined
             )
             SELECT
@@ -158,12 +148,6 @@ class HiveTable:
                     cos(radians(lat)) * cos(radians(next_lat)) *
                     pow(sin((radians(next_lon) - radians(lon)) / 2), 2)
                 )) AS space_diff,
-                UNIX_TIMESTAMP(last_stime) - UNIX_TIMESTAMP(first_stime) AS traj_time,
-                2 * 6371000 * asin(sqrt(
-                    pow(sin((radians(last_lat) - radians(first_lat)) / 2), 2) +
-                    cos(radians(first_lat)) * cos(radians(last_lat)) *
-                    pow(sin((radians(last_lon) - radians(first_lon)) / 2), 2)
-                )) AS traj_space,
                 trajectory_id
             FROM windowed
         """
@@ -177,19 +161,24 @@ class HiveTable:
         - out_summary: 轨迹汇总表（trajectory_id 为粒度）
         """
         df_total = self.process_all(src_table=src_table, cell_info_table=cell_info_table)
+        # cache: DAG 只执行一次，后续 count() 和 summary 聚合均直接读缓存
+        df_total.cache()
         df_total.write.mode("overwrite").saveAsTable(out_total)
         print(f"已保存到表: {out_total}，记录数: {df_total.count()}")
 
-        df_summary = self.__session.sql(f"""
-            SELECT
-                trajectory_id,
-                SUM(time_diff)  AS time_diff,
-                SUM(space_diff) AS space_diff
-            FROM {out_total}
-            GROUP BY trajectory_id
-        """)
+        # 直接在缓存的 df_total 上聚合，无需再读 Hive 表
+        df_summary = (
+            df_total
+            .groupBy("trajectory_id")
+            .agg(
+                F.sum("time_diff").alias("time_diff"),
+                F.sum("space_diff").alias("space_diff"),
+                F.count(F.lit(1)).alias("traj_count")
+            )
+        )
         df_summary.write.mode("overwrite").saveAsTable(out_summary)
         print(f"已保存到表: {out_summary}，记录数: {df_summary.count()}")
+        df_total.unpersist()
 
 # =========================================================
 
