@@ -1,6 +1,7 @@
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.window import Window
 
 
 DEFAULT_TABLES = [
@@ -50,22 +51,71 @@ class HiveTable:
         columns = set(df.columns)
 
         uid_col = self._pick_first_existing(columns, ["uid", "user_id"])
-        time_col = self._pick_first_existing(columns, ["time_diff", "time", "traj_time"])
-        dist_col = self._pick_first_existing(columns, ["space_diff", "distance", "traj_space"])
 
         if uid_col is None:
             raise ValueError(f"Table {src_table} does not have uid/user_id column")
-        if time_col is None:
-            raise ValueError(f"Table {src_table} does not have time_diff/time/traj_time column")
-        if dist_col is None:
-            raise ValueError(f"Table {src_table} does not have space_diff/distance/traj_space column")
+
+        required_cols = ["stime", "lat", "lon"]
+        missing = [col_name for col_name in required_cols if col_name not in columns]
+        if missing:
+            raise ValueError(f"Table {src_table} missing required columns: {', '.join(missing)}")
+
+        partition_cols = [uid_col]
+        if "date" in columns:
+            partition_cols.append("date")
+
+        w = Window.partitionBy(*partition_cols).orderBy(F.col("stime"))
+
+        enriched_df = (
+            df.where(F.col(uid_col).isNotNull())
+            .withColumn("_next_stime", F.lead("stime").over(w))
+            .withColumn("_next_lat", F.lead("lat").over(w))
+            .withColumn("_next_lon", F.lead("lon").over(w))
+        )
+
+        time_diff_expr = (
+            F.unix_timestamp(F.col("_next_stime"))
+            - F.unix_timestamp(F.col("stime"))
+        ).cast("double")
+
+        lat1 = F.radians(F.col("lat").cast("double"))
+        lon1 = F.radians(F.col("lon").cast("double"))
+        lat2 = F.radians(F.col("_next_lat").cast("double"))
+        lon2 = F.radians(F.col("_next_lon").cast("double"))
+
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+
+        a = (
+            F.pow(F.sin(dlat / F.lit(2.0)), F.lit(2.0))
+            + F.cos(lat1) * F.cos(lat2) * F.pow(F.sin(dlon / F.lit(2.0)), F.lit(2.0))
+        )
+        a_clamped = F.least(F.greatest(a, F.lit(0.0)), F.lit(1.0))
+        c = F.lit(2.0) * F.atan2(F.sqrt(a_clamped), F.sqrt(F.lit(1.0) - a_clamped))
+        haversine_dist = F.lit(6371000.0) * c
+
+        metric_df = (
+            enriched_df
+            .withColumn(
+                "_time_value",
+                F.when(F.col("_next_stime").isNull(), F.lit(0.0))
+                .otherwise(F.greatest(time_diff_expr, F.lit(0.0))),
+            )
+            .withColumn(
+                "_dist_value",
+                F.when(
+                    F.col("_next_lat").isNull() | F.col("_next_lon").isNull(),
+                    F.lit(0.0),
+                ).otherwise(F.coalesce(haversine_dist.cast("double"), F.lit(0.0))),
+            )
+        )
 
         uid_metric_df = (
-            df.where(F.col(uid_col).isNotNull())
+            metric_df
             .groupBy(F.col(uid_col).alias("uid"))
             .agg(
-                F.sum(F.coalesce(F.col(time_col).cast("double"), F.lit(0.0))).alias("time"),
-                F.sum(F.coalesce(F.col(dist_col).cast("double"), F.lit(0.0))).alias("distance"),
+                F.sum(F.col("_time_value")).alias("time"),
+                F.sum(F.col("_dist_value")).alias("distance"),
                 F.count(F.lit(1)).alias("cnt"),
             )
         )
