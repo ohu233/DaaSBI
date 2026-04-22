@@ -8,13 +8,12 @@
 - lon: 轨迹点的经度
 - city: 轨迹点所属城市
 - province: 轨迹点所属省份
--date: 轨迹点所属日期，格式为YYYYMMDD
+- date: 轨迹点所属日期，格式为YYYYMMDD
 
-对dataset进行处理（dataset为原始数据，可能会存在异常点导致数据不完整或不准确）：
+对dataset进行处理（dataset为原始数据）：
 1. 筛选跨城市用户（uid）及其轨迹记录
 2. 对筛选后的数据进行排序，按照uid分组，组内按照stime排序
-3. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的_time_value和_dist_value列中，
-另外生成一种表共14张命名为dataset_multicity_timediff30_YYYYMMDD，设定时间阈值，其余不变：如果两行之间时间差小于30，则删除第二行，再与下一行比较，直到时间差大于等于30或没有下一行
+3. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
 4. 输出表格，形式为dataset_multicity_YYYYMMDD，包含以下列：
 - uid: 用户唯一id
 - index: 轨迹点在用户轨迹中的索引，从0开始
@@ -24,9 +23,9 @@
 - lon: 轨迹点的经度
 - city: 轨迹点所属城市
 - province: 轨迹点所属省份
-- _time_value: 与下一轨迹点的时间差（单位：秒），如果没有下一点则为0
-- _dist_value: 与下一轨迹点的空间距离（单位：米），如果没有下一点则为0
-5. 对每个用户的_time_value和_dist_value进行统计，计算最大值、最小值、平均值和中位数，输出表格dataset_multicity_14days_stats，包含以下列：
+- time_value: 与下一轨迹点的时间差（单位：秒），如果没有下一点则为0
+- dist_value: 与下一轨迹点的空间距离（单位：米），如果没有下一点则为0
+5. 对每个用户的time_value和dist_value进行统计，计算最大值、最小值、平均值和中位数，输出表格dataset_multicity_14days_stats，包含以下列：
 - stat_date: 统计日期，格式为YYYYMMDD
 - metric: 统计指标，取值为"time"，"distance"或"count"，分别表示时间差、空间距离和轨迹点数量
 - max_value: 统计指标的最大值
@@ -34,17 +33,16 @@
 - avg_value: 统计指标的平均值
 - median_value: 统计指标的中位数
 
-最后生成表有：14*2+1=29张，分别为：
+最后生成表有：14+1=15张，分别为：
 - dataset_multicity_YYYYMMDD（14张）
-- dataset_multicity_timediff30_YYYYMMDD（14张）
 - dataset_multicity_14days_stats（1张）
-- dataset_multicity_14days_stats_timediff30（1张）
 '''
 
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 from pyspark.sql.window import Window
+import traceback
 
 
 DEFAULT_DATES = [
@@ -89,13 +87,21 @@ class HiveTable:
                 return col_name
         return None
 
+    def _table_exists(self, table_name):
+        # Strict generic check: query metastore tables once and do exact-name match.
+        table_names = {
+            row["tableName"]
+            for row in self.__session.sql("SHOW TABLES").select("tableName").collect()
+        }
+        return table_name in table_names
+
     def _resolve_src_table(self, date_str, src_prefix="dataset"):
         candidates = [
             f"{src_prefix}_{date_str}",
             f"{src_prefix}__{date_str}",
         ]
         for table_name in candidates:
-            if self.__session.catalog.tableExists(table_name):
+            if self._table_exists(table_name):
                 return table_name
         raise ValueError(
             f"Cannot find source table for date {date_str}. Tried: {', '.join(candidates)}"
@@ -109,15 +115,21 @@ class HiveTable:
         if uid_col is None:
             raise ValueError(f"Table {src_table} does not have uid/user_id column")
 
-        required_cols = ["stime", "cid", "lat", "lon", "city", "province"]
+        required_cols = ["index", "stime", "cid", "lat", "lon", "city", "province"]
         missing = [col_name for col_name in required_cols if col_name not in columns]
         if missing:
             raise ValueError(f"Table {src_table} missing required columns: {', '.join(missing)}")
 
         base_df = (
-            df.where(F.col(uid_col).isNotNull() & F.col("stime").isNotNull())
+            df.where(
+                F.col(uid_col).isNotNull()
+                & F.col("index").isNotNull()
+                & F.col("stime").isNotNull()
+            )
+            .withColumn("index_i", F.col("index").cast("long"))
             .withColumn("lat_d", F.col("lat").cast("double"))
             .withColumn("lon_d", F.col("lon").cast("double"))
+            .where(F.col("index_i").isNotNull())
         )
 
         uid_city_df = (
@@ -135,25 +147,24 @@ class HiveTable:
             .withColumn("uid", F.col(uid_col).cast("string"))
         )
 
-        w = Window.partitionBy("uid").orderBy(F.col("stime"))
+        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime"))
 
         with_next_df = (
             detail_df
-            .withColumn("index", F.row_number().over(w) - F.lit(1))
-            .withColumn("_next_stime", F.lead("stime").over(w))
-            .withColumn("_next_lat", F.lead("lat_d").over(w))
-            .withColumn("_next_lon", F.lead("lon_d").over(w))
+            .withColumn("prev_stime", F.lag("stime").over(w))
+            .withColumn("prev_lat", F.lag("lat_d").over(w))
+            .withColumn("prev_lon", F.lag("lon_d").over(w))
         )
 
         time_diff_expr = (
-            F.unix_timestamp(F.col("_next_stime"))
-            - F.unix_timestamp(F.col("stime"))
+            F.unix_timestamp(F.col("stime"))
+            - F.unix_timestamp(F.col("prev_stime"))
         ).cast("double")
 
-        lat1 = F.radians(F.col("lat_d"))
-        lon1 = F.radians(F.col("lon_d"))
-        lat2 = F.radians(F.col("_next_lat"))
-        lon2 = F.radians(F.col("_next_lon"))
+        lat1 = F.radians(F.col("prev_lat"))
+        lon1 = F.radians(F.col("prev_lon"))
+        lat2 = F.radians(F.col("lat_d"))
+        lon2 = F.radians(F.col("lon_d"))
 
         dlat = lat2 - lat1
         dlon = lon2 - lon1
@@ -168,163 +179,30 @@ class HiveTable:
         metric_df = (
             with_next_df
             .withColumn(
-                "_time_value",
-                F.when(F.col("_next_stime").isNull(), F.lit(0.0))
+                "time_value",
+                F.when(F.col("prev_stime").isNull(), F.lit(None).cast("double"))
                 .otherwise(F.greatest(time_diff_expr, F.lit(0.0))),
             )
             .withColumn(
-                "_dist_value",
+                "dist_value",
                 F.when(
-                    F.col("_next_stime").isNull(),
-                    F.lit(0.0),
+                    F.col("prev_stime").isNull(),
+                    F.lit(None).cast("double"),
                 ).otherwise(F.coalesce(haversine_dist.cast("double"), F.lit(0.0))),
-            )
-            .withColumn(
-                "_dist_value",
-                F.when(F.col("_time_value") <= F.lit(0.0), F.lit(0.0))
-                .otherwise(F.col("_dist_value")),
             )
         )
 
         return metric_df.select(
             "uid",
-            "index",
+            F.col("index_i").alias("index"),
             "stime",
             "cid",
             F.col("lat_d").alias("lat"),
             F.col("lon_d").alias("lon"),
             "city",
             "province",
-            "_time_value",
-            "_dist_value",
-        )
-
-    def _build_timediff30_df(self, detail_df):
-        """
-        Keep first point, then only keep points whose time gap to last kept point is >= 30s.
-        This matches: if two rows diff < 30, drop latter and compare next again.
-        """
-        ts_df = (
-            detail_df
-            .withColumn("_ts", F.unix_timestamp(F.col("stime")).cast("long"))
-            .where(F.col("_ts").isNotNull())
-        )
-
-        seed_df = (
-            ts_df
-            .groupBy("uid")
-            .agg(F.min("_ts").alias("_anchor_ts"))
-            .join(ts_df, on="uid", how="inner")
-            .where(F.col("_ts") == F.col("_anchor_ts"))
-            .drop("_anchor_ts")
-            .dropDuplicates(["uid", "_ts"])
-        )
-
-        selected_df = seed_df
-        while True:
-            selected_ts_df = selected_df.select(
-                F.col("uid").alias("uid"),
-                F.col("_ts").alias("_kept_ts"),
-            )
-
-            candidate_df = (
-                ts_df.alias("cur")
-                .join(
-                    selected_ts_df.alias("sel"),
-                    on=F.col("cur.uid") == F.col("sel.uid"),
-                    how="inner",
-                )
-                .where(F.col("cur._ts") > F.col("sel._kept_ts"))
-                .groupBy(F.col("cur.uid").alias("uid"), F.col("cur._ts").alias("_ts"))
-                .agg(F.max("sel._kept_ts").alias("_prev_kept_ts"))
-                .where(F.col("_ts") - F.col("_prev_kept_ts") >= F.lit(30))
-                .groupBy("uid")
-                .agg(F.min("_ts").alias("_next_keep_ts"))
-                .alias("n")
-                .join(
-                    ts_df.alias("t"),
-                    (F.col("n.uid") == F.col("t.uid"))
-                    & (F.col("n._next_keep_ts") == F.col("t._ts")),
-                    "inner",
-                )
-                .select("t.*")
-                .drop("_next_keep_ts")
-                .dropDuplicates(["uid", "_ts"])
-            )
-
-            if candidate_df.rdd.isEmpty():
-                break
-
-            selected_df = (
-                selected_df
-                .unionByName(candidate_df)
-                .dropDuplicates(["uid", "_ts"])
-            )
-
-        filtered_df = selected_df.drop("_ts")
-        return self._build_multicity_detail_df_from_df(filtered_df)
-
-    def _build_multicity_detail_df_from_df(self, input_df):
-        """Recompute index/_time_value/_dist_value from a pre-filtered detail dataframe."""
-        w = Window.partitionBy("uid").orderBy(F.col("stime"))
-
-        with_next_df = (
-            input_df
-            .withColumn("index", F.row_number().over(w) - F.lit(1))
-            .withColumn("_next_stime", F.lead("stime").over(w))
-            .withColumn("_next_lat", F.lead("lat").over(w))
-            .withColumn("_next_lon", F.lead("lon").over(w))
-        )
-
-        time_diff_expr = (
-            F.unix_timestamp(F.col("_next_stime"))
-            - F.unix_timestamp(F.col("stime"))
-        ).cast("double")
-
-        lat1 = F.radians(F.col("lat").cast("double"))
-        lon1 = F.radians(F.col("lon").cast("double"))
-        lat2 = F.radians(F.col("_next_lat").cast("double"))
-        lon2 = F.radians(F.col("_next_lon").cast("double"))
-
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-
-        a = (
-            F.pow(F.sin(dlat / F.lit(2.0)), F.lit(2.0))
-            + F.cos(lat1) * F.cos(lat2) * F.pow(F.sin(dlon / F.lit(2.0)), F.lit(2.0))
-        )
-        c = F.lit(2.0) * F.atan2(F.sqrt(a), F.sqrt(F.lit(1.0) - a))
-        haversine_dist = F.lit(6371000.0) * c
-
-        return (
-            with_next_df
-            .withColumn(
-                "_time_value",
-                F.when(F.col("_next_stime").isNull(), F.lit(0.0))
-                .otherwise(F.greatest(time_diff_expr, F.lit(0.0))),
-            )
-            .withColumn(
-                "_dist_value",
-                F.when(F.col("_next_stime").isNull(), F.lit(0.0))
-                .otherwise(F.coalesce(haversine_dist.cast("double"), F.lit(0.0))),
-            )
-            .withColumn(
-                "_dist_value",
-                F.when(F.col("_time_value") <= F.lit(0.0), F.lit(0.0))
-                .otherwise(F.col("_dist_value")),
-            )
-            .select(
-                "uid",
-                "index",
-                "stime",
-                "cid",
-                F.col("lat").cast("double").alias("lat"),
-                F.col("lon").cast("double").alias("lon"),
-                "city",
-                "province",
-                "_time_value",
-                "_dist_value",
-            )
+            "time_value",
+            "dist_value",
         )
 
     def _build_uid_metric_df(self, multicity_table):
@@ -333,8 +211,8 @@ class HiveTable:
             df.where(F.col("uid").isNotNull())
             .groupBy("uid")
             .agg(
-                F.sum(F.coalesce(F.col("_time_value"), F.lit(0.0))).alias("time"),
-                F.sum(F.coalesce(F.col("_dist_value"), F.lit(0.0))).alias("distance"),
+                F.sum(F.coalesce(F.col("time_value"), F.lit(0.0))).alias("time"),
+                F.sum(F.coalesce(F.col("dist_value"), F.lit(0.0))).alias("distance"),
                 F.count(F.lit(1)).alias("cnt"),
             )
         )
@@ -395,56 +273,51 @@ class HiveTable:
         date_str,
         src_prefix="dataset",
         out_prefix="dataset_multicity",
-        out_timediff30_prefix="dataset_multicity_timediff30",
     ):
         src_table = self._resolve_src_table(date_str=date_str, src_prefix=src_prefix)
         out_table = f"{out_prefix}_{date_str}"
-        out_timediff30_table = f"{out_timediff30_prefix}_{date_str}"
         detail_df = self._build_multicity_detail_df(src_table)
         detail_df.write.mode("overwrite").saveAsTable(out_table)
-        timediff30_df = self._build_timediff30_df(detail_df)
-        timediff30_df.write.mode("overwrite").saveAsTable(out_timediff30_table)
-        print(
-            f"Saved tables: {out_table} rows={detail_df.count()}, "
-            f"{out_timediff30_table} rows={timediff30_df.count()}, from: {src_table}"
-        )
-        return out_table, out_timediff30_table
+        print(f"Saved table: {out_table} rows={detail_df.count()}, from: {src_table}")
+        return out_table
 
     def run_14days_stats(
         self,
         date_list=None,
         src_prefix="dataset",
         multicity_prefix="dataset_multicity",
-        timediff30_prefix="dataset_multicity_timediff30",
         out_table="dataset_multicity_14days_stats",
-        out_timediff30_table="dataset_multicity_14days_stats_timediff30",
     ):
         if date_list is None:
             date_list = DEFAULT_DATES
 
         all_rows = []
-        timediff30_all_rows = []
         multicity_tables = []
-        timediff30_tables = []
+        failed_dates = []
         for date_str in date_list:
-            multicity_table, timediff30_table = self._build_single_day_multicity_table(
-                date_str=date_str,
-                src_prefix=src_prefix,
-                out_prefix=multicity_prefix,
-                out_timediff30_prefix=timediff30_prefix,
+            print(f"[INFO] Start processing date: {date_str}")
+            try:
+                multicity_table = self._build_single_day_multicity_table(
+                    date_str=date_str,
+                    src_prefix=src_prefix,
+                    out_prefix=multicity_prefix,
+                )
+                multicity_tables.append(multicity_table)
+            except Exception as exc:
+                failed_dates.append((date_str, str(exc)))
+                print(f"[WARN] Skip date {date_str}: {exc}")
+                print(traceback.format_exc())
+
+        if not multicity_tables:
+            raise RuntimeError(
+                "No daily tables were generated successfully. "
+                "Please check failed-date logs above."
             )
-            multicity_tables.append(multicity_table)
-            timediff30_tables.append(timediff30_table)
 
         for table_name in multicity_tables:
             rows = self._calc_single_table_rows(table_name)
             all_rows.extend(rows)
             print(f"Finished stats for table: {table_name}")
-
-        for table_name in timediff30_tables:
-            rows = self._calc_single_table_rows(table_name)
-            timediff30_all_rows.extend(rows)
-            print(f"Finished timediff30 stats for table: {table_name}")
 
         schema = StructType([
             StructField("stat_date", StringType(), False),
@@ -456,7 +329,6 @@ class HiveTable:
         ])
 
         result_df = self.__session.createDataFrame(all_rows, schema=schema)
-        timediff30_result_df = self.__session.createDataFrame(timediff30_all_rows, schema=schema)
 
         metric_order = F.when(F.col("metric") == "time", F.lit(1)) \
             .when(F.col("metric") == "distance", F.lit(2)) \
@@ -464,12 +336,13 @@ class HiveTable:
             .otherwise(F.lit(99))
 
         result_df = result_df.orderBy(F.col("stat_date"), metric_order)
-        timediff30_result_df = timediff30_result_df.orderBy(F.col("stat_date"), metric_order)
         result_df.write.mode("overwrite").saveAsTable(out_table)
-        timediff30_result_df.write.mode("overwrite").saveAsTable(out_timediff30_table)
 
         print(f"Saved table: {out_table}, rows: {result_df.count()}")
-        print(f"Saved table: {out_timediff30_table}, rows: {timediff30_result_df.count()}")
+        if failed_dates:
+            print("[WARN] Failed dates summary:")
+            for date_str, reason in failed_dates:
+                print(f"  - {date_str}: {reason}")
 
 
 if __name__ == "__main__":
@@ -479,9 +352,7 @@ if __name__ == "__main__":
             date_list=DEFAULT_DATES,
             src_prefix="dataset",
             multicity_prefix="dataset_multicity",
-            timediff30_prefix="dataset_multicity_timediff30",
             out_table="dataset_multicity_14days_stats",
-            out_timediff30_table="dataset_multicity_14days_stats_timediff30",
         )
     finally:
         table.stop()
