@@ -14,6 +14,7 @@
 1. 筛选跨城市用户（uid）及其轨迹记录
 2. 对筛选后的数据进行排序，按照uid分组，组内按照stime排序
 3. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
+TODO:漂移数据，乒乓数据处理：参考浙大学位论文
 4. 输出表格，形式为dataset_multicity_YYYYMMDD，包含以下列：
 - uid: 用户唯一id
 - index: 轨迹点在用户轨迹中的索引，从0开始
