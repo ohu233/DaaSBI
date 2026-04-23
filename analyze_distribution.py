@@ -5,6 +5,11 @@ import csv
 import math
 from pathlib import Path
 
+try:
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - 运行时依赖检查
+    plt = None
+
 
 DEFAULT_BINS = 50
 DEFAULT_MAX_PERCENTILE = 0.99
@@ -158,84 +163,48 @@ def format_number(value: float) -> str:
     return f"{value:.2f}"
 
 
-def render_histogram_svg(
+def render_histogram_png(
     histogram: list[tuple[float, float, int]],
     title: str,
     x_label: str,
     y_label: str,
     output_path: Path,
 ) -> None:
+    if plt is None:
+        raise RuntimeError("未安装 matplotlib，无法输出 PNG。请先执行: pip install matplotlib")
+
+    fig, ax = plt.subplots(figsize=(CHART_WIDTH / 100, CHART_HEIGHT / 100), dpi=100)
+
     if not histogram:
-        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{CHART_WIDTH}" height="{CHART_HEIGHT}">
-  <rect width="100%" height="100%" fill="#ffffff"/>
-  <text x="50%" y="50%" text-anchor="middle" font-size="28" fill="#333333">{title}: 无可用数据</text>
-</svg>
-'''
-        output_path.write_text(svg, encoding="utf-8")
-        return
-
-    left_margin = 100
-    right_margin = 40
-    top_margin = 70
-    bottom_margin = 120
-    plot_width = CHART_WIDTH - left_margin - right_margin
-    plot_height = CHART_HEIGHT - top_margin - bottom_margin
-    max_frequency = max(frequency for _, _, frequency in histogram) or 1
-    bar_width = plot_width / len(histogram)
-
-    elements: list[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{CHART_WIDTH}" height="{CHART_HEIGHT}">',
-        '  <rect width="100%" height="100%" fill="#ffffff"/>',
-        f'  <text x="{CHART_WIDTH / 2:.0f}" y="40" text-anchor="middle" font-size="28" fill="#1f2937">{title}</text>',
-        f'  <line x1="{left_margin}" y1="{top_margin + plot_height}" x2="{left_margin + plot_width}" y2="{top_margin + plot_height}" stroke="#111827" stroke-width="2"/>',
-        f'  <line x1="{left_margin}" y1="{top_margin}" x2="{left_margin}" y2="{top_margin + plot_height}" stroke="#111827" stroke-width="2"/>',
-    ]
-
-    for tick in range(6):
-        y = top_margin + plot_height - (plot_height * tick / 5)
-        frequency = round(max_frequency * tick / 5)
-        elements.append(
-            f'  <line x1="{left_margin}" y1="{y:.2f}" x2="{left_margin + plot_width}" y2="{y:.2f}" stroke="#e5e7eb" stroke-width="1"/>'
-        )
-        elements.append(
-            f'  <text x="{left_margin - 12}" y="{y + 5:.2f}" text-anchor="end" font-size="14" fill="#374151">{frequency}</text>'
-        )
-
-    for index, (left, right, frequency) in enumerate(histogram):
-        bar_height = 0 if max_frequency == 0 else plot_height * frequency / max_frequency
-        x = left_margin + index * bar_width
-        y = top_margin + plot_height - bar_height
-        width = max(bar_width - 1, 1)
-        elements.append(
-            f'  <rect x="{x:.2f}" y="{y:.2f}" width="{width:.2f}" height="{bar_height:.2f}" fill="#2563eb" opacity="0.85"/>'
-        )
-
-    tick_count = min(6, len(histogram))
-    if tick_count == 1:
-        tick_positions = [0]
+        ax.text(0.5, 0.5, f"{title}: 无可用数据", ha="center", va="center", fontsize=20, color="#333333")
+        ax.axis("off")
     else:
-        tick_positions = sorted({round(index * (len(histogram) - 1) / (tick_count - 1)) for index in range(tick_count)})
+        centers = [(left + right) / 2 for left, right, _ in histogram]
+        widths = [max(right - left, 1e-9) for left, right, _ in histogram]
+        frequencies = [frequency for _, _, frequency in histogram]
 
-    for position in tick_positions:
-        left, right, _ = histogram[position]
-        x = left_margin + position * bar_width
-        label = f"{format_number(left)}-{format_number(right)}"
-        elements.append(
-            f'  <line x1="{x:.2f}" y1="{top_margin + plot_height}" x2="{x:.2f}" y2="{top_margin + plot_height + 8}" stroke="#111827" stroke-width="1"/>'
-        )
-        elements.append(
-            f'  <text x="{x:.2f}" y="{top_margin + plot_height + 28}" text-anchor="end" transform="rotate(-35 {x:.2f} {top_margin + plot_height + 28})" font-size="12" fill="#374151">{label}</text>'
-        )
+        ax.bar(centers, frequencies, width=widths, color="#2563eb", alpha=0.85, edgecolor="white", linewidth=0.6)
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
 
-    elements.extend(
-        [
-            f'  <text x="{CHART_WIDTH / 2:.0f}" y="{CHART_HEIGHT - 24}" text-anchor="middle" font-size="18" fill="#111827">{x_label}</text>',
-            f'  <text x="28" y="{CHART_HEIGHT / 2:.0f}" text-anchor="middle" transform="rotate(-90 28 {CHART_HEIGHT / 2:.0f})" font-size="18" fill="#111827">{y_label}</text>',
-            "</svg>",
+        tick_count = min(6, len(histogram))
+        if tick_count == 1:
+            tick_positions = [0]
+        else:
+            tick_positions = sorted({round(index * (len(histogram) - 1) / (tick_count - 1)) for index in range(tick_count)})
+
+        tick_values = [centers[position] for position in tick_positions]
+        tick_labels = [
+            f"{format_number(histogram[position][0])}-{format_number(histogram[position][1])}"
+            for position in tick_positions
         ]
-    )
+        ax.set_xticks(tick_values, tick_labels, rotation=35, ha="right")
 
-    output_path.write_text("\n".join(elements) + "\n", encoding="utf-8")
+    fig.tight_layout()
+    fig.savefig(output_path, format="png")
+    plt.close(fig)
 
 
 def analyze_column(
@@ -257,12 +226,12 @@ def analyze_column(
         summarize(values, skipped, skipped_zero, skipped_high, upper_bound),
         output_dir / f"{column_name}_summary.csv",
     )
-    render_histogram_svg(
+    render_histogram_png(
         histogram,
         title=f"{column_name} 分布图",
         x_label="值",
         y_label="频次",
-        output_path=output_dir / f"{column_name}_distribution.svg",
+        output_path=output_dir / f"{column_name}_distribution.png",
     )
 
 
@@ -270,8 +239,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="统计 CSV 中 time_value 和 dist_value 的分布并生成图表。")
     parser.add_argument(
         "--input",
-        default="20230918.csv",
-        help="输入 CSV 文件路径，默认读取当前目录下的 20230918.csv",
+        default="distribution/20230918.csv",
+        help="输入 CSV 文件路径，默认读取 distribution/20230918.csv",
     )
     parser.add_argument(
         "--bins",
@@ -300,7 +269,27 @@ def main() -> None:
     if not 0 < args.max_percentile <= 1:
         raise ValueError("--max-percentile 必须在 0 到 1 之间")
 
-    csv_path = Path(args.input).resolve()
+    script_dir = Path(__file__).resolve().parent
+    input_path = Path(args.input)
+
+    if input_path.is_absolute():
+        csv_path = input_path
+    else:
+        candidates = [
+            Path.cwd() / input_path,
+            script_dir / input_path,
+            Path.cwd() / "distribution" / input_path,
+            script_dir / "distribution" / input_path,
+        ]
+        csv_path = next((path for path in candidates if path.exists()), candidates[0])
+
+    csv_path = csv_path.resolve()
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            "未找到输入文件: "
+            f"{csv_path}。请检查 --input 参数，或使用默认路径 distribution/20230918.csv。"
+        )
+
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
