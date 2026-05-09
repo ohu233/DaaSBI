@@ -3,3 +3,5 @@
 SHOW tables;
 
 SELECT COUNT(*) FROM dataset_multicity_20230917;
+
+SELECT DISTINCT(uid) FROM dataset_multicity_20230917;

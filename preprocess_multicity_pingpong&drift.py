@@ -166,6 +166,21 @@ class HiveTable:
             .drop("stay_group")
         )
 
+    def _merge_same_time(self, df):
+        return (
+            df.groupBy("uid", "stime_ts")
+            .agg(
+                F.min("index_i").alias("index_i"),
+                F.first("cid").alias("cid"),
+                F.avg("lat_d").alias("lat_d"),
+                F.avg("lon_d").alias("lon_d"),
+                F.first("city").alias("city"),
+                F.first("province").alias("province"),
+                F.first("attribution").alias("attribution"),
+                F.count("*").alias("_merge_time_cnt"),
+            )
+        )
+
     def _remove_drift(self, df):
         is_overspeed = (
             (F.col("time_value") > 0)
@@ -181,60 +196,72 @@ class HiveTable:
         )
 
     def _fix_pingpong(self, df):
-        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime_ts"))
+        """Detect longest A⇆B oscillation chains (min ABA) and merge each chain into one row."""
+        w = Window.partitionBy("uid").orderBy("index_i", "stime_ts")
 
-        d = (
+        with_ctx = (
             df
-            .withColumn("_prev_lat", F.lag("lat_d", 1).over(w))
-            .withColumn("_prev_lon", F.lag("lon_d", 1).over(w))
-            .withColumn("_prev_ts", F.lag("stime_ts", 1).over(w))
-            .withColumn("_prev_attr", F.lag("attribution", 1).over(w))
-
-            .withColumn("_next_lat", F.lead("lat_d", 1).over(w))
-            .withColumn("_next_lon", F.lead("lon_d", 1).over(w))
-            .withColumn("_next_ts", F.lead("stime_ts", 1).over(w))
-            .withColumn("_next_attr", F.lead("attribution", 1).over(w))
-        )
-
-        is_pingpong = (
-            F.col("_prev_lat").isNotNull()
-            & F.col("_next_lat").isNotNull()
-            & (F.col("_prev_lat") == F.col("_next_lat"))
-            & (F.col("_prev_lon") == F.col("_next_lon"))
-            & (
-                (F.col("lat_d") != F.col("_prev_lat"))
-                | (F.col("lon_d") != F.col("_prev_lon"))
+            .withColumn("_p1_lat", F.lag("lat_d", 1).over(w))
+            .withColumn("_p1_lon", F.lag("lon_d", 1).over(w))
+            .withColumn("_p2_lat", F.lag("lat_d", 2).over(w))
+            .withColumn("_p2_lon", F.lag("lon_d", 2).over(w))
+            .withColumn("_p2_ts",  F.lag("stime_ts", 2).over(w))
+            # materialize is_echo
+            .withColumn(
+                "_is_echo",
+                F.col("_p2_lat").isNotNull()
+                & (F.col("lat_d") == F.col("_p2_lat"))
+                & (F.col("lon_d") == F.col("_p2_lon"))
+                & ((F.col("lat_d") != F.col("_p1_lat")) | (F.col("lon_d") != F.col("_p1_lon")))
+                & (
+                    (F.col("stime_ts").cast("long") - F.col("_p2_ts").cast("long"))
+                    < F.lit(self.PINGPONG_TIME_THRESHOLD)
+                ),
             )
-            & (
-                (F.col("_next_ts").cast("long") - F.col("_prev_ts").cast("long"))
-                < F.lit(self.PINGPONG_TIME_THRESHOLD)
+            # materialize in_osc (echo self, or prev will echo, or prev-prev will echo)
+            .withColumn(
+                "_in_osc",
+                F.coalesce(F.col("_is_echo"), F.lit(False))
+                | F.coalesce(F.lead("_is_echo", 1).over(w), F.lit(False))
+                | F.coalesce(F.lead("_is_echo", 2).over(w), F.lit(False)),
+            )
+            # materialize osc_grp
+            .withColumn(
+                "_prev_in_osc",
+                F.lag("_in_osc", 1, False).over(w),
+            )
+            .withColumn(
+                "_boundary",
+                ((F.col("_in_osc") != F.col("_prev_in_osc")) | (~F.col("_in_osc"))).cast("int"),
+            )
+            .withColumn(
+                "osc_grp",
+                F.sum("_boundary").over(
+                    w.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+                ),
             )
         )
-
-        avg_lat = (F.col("_prev_lat") + F.col("_next_lat")) / F.lit(2.0)
-        avg_lon = (F.col("_prev_lon") + F.col("_next_lon")) / F.lit(2.0)
-        avg_ts = (
-            F.col("_prev_ts").cast("long") + F.col("_next_ts").cast("long")
-        ) / F.lit(2.0)
 
         return (
-            d
-            .withColumn("lat_d", F.when(is_pingpong, avg_lat).otherwise(F.col("lat_d")))
-            .withColumn("lon_d", F.when(is_pingpong, avg_lon).otherwise(F.col("lon_d")))
-            .withColumn(
-                "stime_ts",
-                F.when(is_pingpong, F.from_unixtime(avg_ts).cast("timestamp"))
-                .otherwise(F.col("stime_ts"))
+            with_ctx
+            .groupBy("uid", "osc_grp")
+            .agg(
+                F.min("index_i").alias("index_i"),
+                F.from_unixtime(F.avg(F.col("stime_ts").cast("long"))).cast("timestamp").alias("stime_ts"),
+                F.first("cid").alias("cid"),
+                F.avg("lat_d").alias("lat_d"),
+                F.avg("lon_d").alias("lon_d"),
+                F.first("city").alias("city"),
+                F.first("province").alias("province"),
+                F.max("_in_osc").alias("_is_osc"),
+                F.first("attribution").alias("_orig_attr"),
             )
             .withColumn(
                 "attribution",
-                F.when(is_pingpong, F.lit("pingpong"))
-                .otherwise(F.col("attribution"))
+                F.when(F.col("_is_osc"), F.lit("pingpong"))
+                .otherwise(F.col("_orig_attr")),
             )
-            .drop(
-                "_prev_lat", "_prev_lon", "_prev_ts", "_prev_attr",
-                "_next_lat", "_next_lon", "_next_ts", "_next_attr"
-            )
+            .drop("_is_osc", "_orig_attr", "osc_grp")
         )
 
     def _resolve_src_table(self, date_str, src_prefix="dataset"):
@@ -300,16 +327,28 @@ class HiveTable:
             .orderBy("uid", "index_i")
         )
 
-        # Step 3: handle ping-pong (detect and merge oscillation chains)
-        #result_df = self._fix_pingpong(result_df).orderBy("uid", "index_i")
+        # Step 2b: merge same-time records (avg coordinates)
+        result_df = (
+            self._merge_same_time(result_df)
+            .withColumn(
+                "attribution",
+                F.when(F.col("_merge_time_cnt") > 1, F.lit("merge"))
+                .otherwise(F.col("attribution")),
+            )
+            .drop("_merge_time_cnt")
+            .orderBy("uid", "index_i")
+        )
 
-        # TODO: uncomment steps below after pingpong is verified
+        # Step 3: handle ping-pong (detect and merge oscillation chains)
+        result_df = self._fix_pingpong(result_df).orderBy("uid", "index_i")
+
+        # TODO: uncomment steps below when ready
         # # Step 4: handle drift
         # result_df = self._add_time_dist_columns(result_df)
         # result_df = self._remove_drift(result_df)
-        #
-        # # Final time/dist calculation
-        # result_df = self._add_time_dist_columns(result_df)
+
+        # Final time/dist calculation (lag: saved in later row, first row = 0)
+        result_df = self._add_time_dist_columns(result_df)
 
         # Re-number idx from 1 per uid after processing
         idx_window = Window.partitionBy("uid").orderBy("index_i")
@@ -322,6 +361,12 @@ class HiveTable:
             F.date_format("stime_ts", "yyyy-MM-dd HH:mm:ss").alias("stime"),
             F.col("lat_d").alias("lat"),
             F.col("lon_d").alias("lon"),
+            F.coalesce(F.col("time_value"), F.lit(0.0)).alias("time_value"),
+            F.coalesce(F.col("dist_value"), F.lit(0.0)).alias("dist_value"),
+            F.when(
+                F.col("time_value") > 0,
+                F.col("dist_value") / F.col("time_value") * F.lit(3.6),
+            ).otherwise(F.lit(0.0)).alias("velocity"),
             "attribution",
         )
 
