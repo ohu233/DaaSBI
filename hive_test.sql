@@ -1,5 +1,5 @@
--- Active: 1778174586959@@127.0.0.1@11000@ss_seu_df
+-- Active: 1778224814412@@100.80.26.90@11000@ss_seu_df
 
 SHOW tables;
 
-SELECT * FROM dataset_20230917;
+SELECT COUNT(*) FROM dataset_20230917;

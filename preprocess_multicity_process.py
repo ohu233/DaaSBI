@@ -49,10 +49,13 @@ import pyspark.sql.functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 from pyspark.sql.window import Window
 import traceback
+import os
 
 
 DEFAULT_DATES = [
-    "20230917",
+    "20230917"
+]
+''',
     "20230918",
     "20230919",
     "20230920",
@@ -65,22 +68,34 @@ DEFAULT_DATES = [
     "20250917",
     "20250918",
     "20250919",
-    "20250920",
-]
-
+    "20250920",'''
 
 class HiveTable:
-    def __init__(self, db="ss_seu_df"):
-        session = (
-            SparkSession.builder
-            .enableHiveSupport()
-            .getOrCreate()
-        )
-        session.sql(f"USE {db}")
-        self.__session = session
-
     MAX_SPEED_MPS = 83.33          # 300 km/h
     PINGPONG_TIME_THRESHOLD = 300  # seconds
+
+    def __init__(self, db="ss_seu_df", local=False):
+        builder = SparkSession.builder.enableHiveSupport()
+
+        if local:
+            warehouse = f"file://{os.path.expanduser('~/hive/warehouse')}"
+            builder = (
+                builder
+                .appName("preprocess_multicity")
+                .master("local[*]")
+                .config("spark.hadoop.hive.metastore.uris", "thrift://localhost:9083")
+                .config("spark.sql.warehouse.dir", warehouse)
+                .config("spark.sql.hive.metastore.version", "4.1.0")
+                .config("spark.sql.hive.metastore.jars", "maven")
+                .config("spark.sql.ansi.enabled", "false")
+            )
+
+        session = builder.getOrCreate()
+        session.sparkContext.setLogLevel("WARN")
+        session.sql(f"CREATE DATABASE IF NOT EXISTS {db}")
+        session.sql(f"USE {db}")
+        self.__session = session
+        self.__local = local
 
     def stop(self):
         self.__session.stop()
@@ -96,27 +111,48 @@ class HiveTable:
                 return col_name
         return None
 
+    @staticmethod
+    def parse_time_col(col_name="stime"):
+        s = F.trim(F.col(col_name).cast("string"))
+        ts_seconds = F.coalesce(
+            F.unix_timestamp(s, "yyyy/M/d H:mm"),
+            F.unix_timestamp(s, "yyyy/M/d HH:mm"),
+            F.unix_timestamp(s, "yyyy/M/d H:mm:ss"),
+            F.unix_timestamp(s, "yyyy/M/d HH:mm:ss"),
+            F.unix_timestamp(s, "yyyy-MM-dd HH:mm:ss"),
+            F.unix_timestamp(s, "yyyy-MM-dd HH:mm"),
+            F.unix_timestamp(s, "yyyy/MM/dd HH:mm:ss"),
+            F.unix_timestamp(s, "yyyy/MM/dd HH:mm"),
+        )
+        return F.from_unixtime(ts_seconds).cast("timestamp")
+
     def _table_exists(self, table_name):
-        # Strict generic check: query metastore tables once and do exact-name match.
         table_names = {
             row["tableName"]
             for row in self.__session.sql("SHOW TABLES").select("tableName").collect()
         }
         return table_name in table_names
 
+    def _add_missing_optional_columns(self, df):
+        cols = set(df.columns)
+        if "cid" not in cols:
+            df = df.withColumn("cid", F.lit(None).cast("string"))
+        if "province" not in cols:
+            df = df.withColumn("province", F.lit(None).cast("string"))
+        return df
+
     def _add_time_dist_columns(self, df):
-        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime"))
+        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime_ts"))
 
         with_prev = (
             df
-            .withColumn("prev_stime", F.lag("stime").over(w))
+            .withColumn("prev_stime_ts", F.lag("stime_ts").over(w))
             .withColumn("prev_lat", F.lag("lat_d").over(w))
             .withColumn("prev_lon", F.lag("lon_d").over(w))
         )
 
-        time_diff_expr = (
-            F.unix_timestamp(F.col("stime"))
-            - F.unix_timestamp(F.col("prev_stime"))
+        time_diff = (
+            F.col("stime_ts").cast("long") - F.col("prev_stime_ts").cast("long")
         ).cast("double")
 
         lat1 = F.radians(F.col("prev_lat"))
@@ -138,21 +174,19 @@ class HiveTable:
             with_prev
             .withColumn(
                 "time_value",
-                F.when(F.col("prev_stime").isNull(), F.lit(None).cast("double"))
-                .otherwise(F.greatest(time_diff_expr, F.lit(0.0))),
+                F.when(F.col("prev_stime_ts").isNull(), F.lit(0.0))
+                .otherwise(F.greatest(time_diff, F.lit(0.0))),
             )
             .withColumn(
                 "dist_value",
-                F.when(
-                    F.col("prev_stime").isNull(),
-                    F.lit(None).cast("double"),
-                ).otherwise(F.coalesce(haversine_dist.cast("double"), F.lit(0.0))),
+                F.when(F.col("prev_stime_ts").isNull(), F.lit(0.0))
+                .otherwise(F.coalesce(haversine_dist.cast("double"), F.lit(0.0))),
             )
-            .drop("prev_stime", "prev_lat", "prev_lon")
+            .drop("prev_stime_ts", "prev_lat", "prev_lon")
         )
 
     def _merge_same_coord(self, df):
-        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime"))
+        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime_ts"))
 
         coord_changed = (
             F.lag("lat_d").over(w).isNull()
@@ -160,15 +194,16 @@ class HiveTable:
             | (F.col("lon_d") != F.lag("lon_d").over(w))
         ).cast("int")
 
-        stay_group = F.sum(coord_changed).over(w.rowsBetween(Window.unboundedPreceding, Window.currentRow))
+        stay_group = F.sum(coord_changed).over(
+            w.rowsBetween(Window.unboundedPreceding, Window.currentRow)
+        )
 
         return (
             df.withColumn("stay_group", stay_group)
-            .withColumn("stime_ts", F.unix_timestamp("stime").cast("double"))
             .groupBy("uid", "stay_group")
             .agg(
                 F.first("index_i").alias("index_i"),
-                F.from_unixtime(F.avg("stime_ts")).alias("stime"),
+                F.from_unixtime(F.avg(F.col("stime_ts").cast("long"))).cast("timestamp").alias("stime_ts"),
                 F.first("cid").alias("cid"),
                 F.first("lat_d").alias("lat_d"),
                 F.first("lon_d").alias("lon_d"),
@@ -180,9 +215,8 @@ class HiveTable:
 
     def _remove_drift(self, df):
         is_overspeed = (
-            F.col("time_value").isNotNull()
-            & (F.col("time_value") > 0)
-            & (F.col("dist_value").isNotNull())
+            (F.col("time_value") > 0)
+            & (F.col("dist_value") > 0)
             & ((F.col("dist_value") / F.col("time_value")) > F.lit(self.MAX_SPEED_MPS))
         )
         return (
@@ -191,7 +225,7 @@ class HiveTable:
         )
 
     def _fix_pingpong(self, df):
-        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime"))
+        w = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime_ts"))
 
         with_neighbors = (
             df
@@ -201,8 +235,8 @@ class HiveTable:
             .withColumn("_next_lat", F.lead("lat_d").over(w))
             .withColumn("_prev_lon", F.lag("lon_d").over(w))
             .withColumn("_next_lon", F.lead("lon_d").over(w))
-            .withColumn("_prev_stime", F.lag("stime").over(w))
-            .withColumn("_next_stime", F.lead("stime").over(w))
+            .withColumn("_prev_ts", F.lag("stime_ts").over(w))
+            .withColumn("_next_ts", F.lead("stime_ts").over(w))
         )
 
         is_pingpong = (
@@ -211,26 +245,33 @@ class HiveTable:
             & (F.col("_prev_cid") == F.col("_next_cid"))
             & (F.col("_prev_cid") != F.col("cid"))
             & (
-                (F.unix_timestamp("_next_stime") - F.unix_timestamp("_prev_stime"))
+                (F.col("_next_ts").cast("long") - F.col("_prev_ts").cast("long"))
                 < F.lit(self.PINGPONG_TIME_THRESHOLD)
             )
         )
 
         avg_lat = (F.col("_prev_lat") + F.col("_next_lat")) / F.lit(2.0)
         avg_lon = (F.col("_prev_lon") + F.col("_next_lon")) / F.lit(2.0)
-        avg_stime_ts = (
-            F.unix_timestamp("_prev_stime").cast("double")
-            + F.unix_timestamp("_next_stime").cast("double")
+        avg_ts = (
+            F.col("_prev_ts").cast("long") + F.col("_next_ts").cast("long")
         ) / F.lit(2.0)
 
         return (
             with_neighbors
             .withColumn("lat_d", F.when(is_pingpong, avg_lat).otherwise(F.col("lat_d")))
             .withColumn("lon_d", F.when(is_pingpong, avg_lon).otherwise(F.col("lon_d")))
-            .withColumn("stime", F.when(is_pingpong, F.from_unixtime(avg_stime_ts)).otherwise(F.col("stime")))
-            .drop("_prev_cid", "_next_cid", "_prev_lat", "_next_lat",
-                  "_prev_lon", "_next_lon", "_prev_stime", "_next_stime",
-                  "time_value", "dist_value")
+            .withColumn(
+                "stime_ts",
+                F.when(is_pingpong, F.from_unixtime(avg_ts).cast("timestamp"))
+                .otherwise(F.col("stime_ts")),
+            )
+            .drop(
+                "_prev_cid", "_next_cid",
+                "_prev_lat", "_next_lat",
+                "_prev_lon", "_next_lon",
+                "_prev_ts", "_next_ts",
+                "time_value", "dist_value",
+            )
         )
 
     def _resolve_src_table(self, date_str, src_prefix="dataset"):
@@ -245,16 +286,20 @@ class HiveTable:
             f"Cannot find source table for date {date_str}. Tried: {', '.join(candidates)}"
         )
 
-    def _build_multicity_detail_df(self, src_table):
+    def _build_multicity_detail_df(self, src_table, filter_multicity_only=True):
         df = self.__session.table(src_table)
         columns = set(df.columns)
 
+        # uid column: support "uid" or "user_id"
         uid_col = self._pick_first_existing(columns, ["uid", "user_id"])
         if uid_col is None:
             raise ValueError(f"Table {src_table} does not have uid/user_id column")
 
-        required_cols = ["index", "stime", "cid", "lat", "lon", "city", "province"]
-        missing = [col_name for col_name in required_cols if col_name not in columns]
+        # add optional columns if missing
+        df = self._add_missing_optional_columns(df)
+
+        required_cols = ["index", "stime", "lat", "lon", "city"]
+        missing = [c for c in required_cols if c not in set(df.columns)]
         if missing:
             raise ValueError(f"Table {src_table} missing required columns: {', '.join(missing)}")
 
@@ -263,27 +308,33 @@ class HiveTable:
                 F.col(uid_col).isNotNull()
                 & F.col("index").isNotNull()
                 & F.col("stime").isNotNull()
+                & F.col("lat").isNotNull()
+                & F.col("lon").isNotNull()
             )
+            .withColumn("uid", F.col(uid_col).cast("string"))
             .withColumn("index_i", F.col("index").cast("long"))
+            .withColumn("stime_ts", self.parse_time_col("stime"))
             .withColumn("lat_d", F.col("lat").cast("double"))
             .withColumn("lon_d", F.col("lon").cast("double"))
-            .where(F.col("index_i").isNotNull())
+            .where(
+                F.col("index_i").isNotNull()
+                & F.col("stime_ts").isNotNull()
+                & F.col("lat_d").isNotNull()
+                & F.col("lon_d").isNotNull()
+            )
         )
 
-        uid_city_df = (
-            base_df.where(F.col("city").isNotNull())
-            .groupBy(F.col(uid_col).alias("uid"))
-            .agg(F.countDistinct("city").alias("city_cnt"))
-            .where(F.col("city_cnt") > 1)
-            .select("uid")
-        )
-
-        detail_df = (
-            base_df
-            .join(uid_city_df, base_df[uid_col] == uid_city_df["uid"], how="inner")
-            .drop(uid_city_df["uid"])
-            .withColumn("uid", F.col(uid_col).cast("string"))
-        )
+        if filter_multicity_only:
+            uid_city_df = (
+                base_df.where(F.col("city").isNotNull())
+                .groupBy("uid")
+                .agg(F.countDistinct("city").alias("city_cnt"))
+                .where(F.col("city_cnt") > 1)
+                .select("uid")
+            )
+            detail_df = base_df.join(uid_city_df, on="uid", how="inner")
+        else:
+            detail_df = base_df
 
         # Step 1: drop duplicates
         dedup_df = detail_df.dropDuplicates()
@@ -303,20 +354,20 @@ class HiveTable:
         result_df = self._add_time_dist_columns(pingpong_fixed)
 
         # Re-number index sequentially from 0 per uid
-        idx_window = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime"))
+        idx_window = Window.partitionBy("uid").orderBy(F.col("index_i"), F.col("stime_ts"))
         result_df = result_df.withColumn("index_i", F.row_number().over(idx_window) - F.lit(1))
 
         return result_df.select(
             "uid",
             F.col("index_i").alias("index"),
-            "stime",
+            F.date_format("stime_ts", "yyyy-MM-dd HH:mm:ss").alias("stime"),
             "cid",
             F.col("lat_d").alias("lat"),
             F.col("lon_d").alias("lon"),
             "city",
             "province",
-            "time_value",
-            "dist_value",
+            F.coalesce(F.col("time_value"), F.lit(0.0)).alias("time_value"),
+            F.coalesce(F.col("dist_value"), F.lit(0.0)).alias("dist_value"),
         )
 
     def _build_uid_metric_df(self, multicity_table):
@@ -334,6 +385,15 @@ class HiveTable:
 
     def _calc_single_table_rows(self, multicity_table):
         uid_metric_df = self._build_uid_metric_df(multicity_table)
+        table_date = self._table_date(multicity_table)
+
+        if uid_metric_df.limit(1).count() == 0:
+            return [
+                (table_date, "time", None, None, None, None),
+                (table_date, "distance", None, None, None, None),
+                (table_date, "count", 0.0, 0.0, 0.0, 0.0),
+            ]
+
         stats_row = (
             uid_metric_df
             .agg(
@@ -353,7 +413,6 @@ class HiveTable:
             .collect()[0]
         )
 
-        table_date = self._table_date(multicity_table)
         rows = [
             (
                 table_date,
@@ -387,10 +446,13 @@ class HiveTable:
         date_str,
         src_prefix="dataset",
         out_prefix="dataset_multicity",
+        filter_multicity_only=True,
     ):
         src_table = self._resolve_src_table(date_str=date_str, src_prefix=src_prefix)
         out_table = f"{out_prefix}_{date_str}"
-        detail_df = self._build_multicity_detail_df(src_table)
+        detail_df = self._build_multicity_detail_df(
+            src_table, filter_multicity_only=filter_multicity_only
+        )
         detail_df.write.mode("overwrite").saveAsTable(out_table)
         print(f"Saved table: {out_table} rows={detail_df.count()}, from: {src_table}")
         return out_table
@@ -401,6 +463,7 @@ class HiveTable:
         src_prefix="dataset",
         multicity_prefix="dataset_multicity",
         out_table="dataset_multicity_14days_stats",
+        filter_multicity_only=True,
     ):
         if date_list is None:
             date_list = DEFAULT_DATES
@@ -415,6 +478,7 @@ class HiveTable:
                     date_str=date_str,
                     src_prefix=src_prefix,
                     out_prefix=multicity_prefix,
+                    filter_multicity_only=filter_multicity_only,
                 )
                 multicity_tables.append(multicity_table)
             except Exception as exc:
@@ -460,15 +524,16 @@ class HiveTable:
 
 
 if __name__ == "__main__":
-    table = HiveTable(db="ss_seu_df")
+    # Set local=True for local Hive testing; local=False (default) for YARN cluster
+    table = HiveTable(db="ss_seu_df", local=True)
     try:
         table.run_14days_stats(
             date_list=DEFAULT_DATES,
             src_prefix="dataset",
             multicity_prefix="dataset_multicity",
             out_table="dataset_multicity_14days_stats",
+            filter_multicity_only=True,
         )
     finally:
         table.stop()
-
 # spark-submit: --master yarn --deploy-mode cluster
