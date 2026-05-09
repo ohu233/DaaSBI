@@ -36,7 +36,7 @@ import os
 DEFAULT_DATES = ["20230917"]
 
 class HiveTable:
-    MAX_SPEED_MPS = 83.33          # 300 km/h
+    MAX_SPEED_KMH = 600            # 600 km/h drift threshold
     PINGPONG_TIME_THRESHOLD = 300  # seconds
 
     def __init__(self, db="ss_seu_df", local=False):
@@ -185,15 +185,9 @@ class HiveTable:
         is_overspeed = (
             (F.col("time_value") > 0)
             & (F.col("dist_value") > 0)
-            & ((F.col("dist_value") / F.col("time_value")) > F.lit(self.MAX_SPEED_MPS))
+            & ((F.col("dist_value") / F.col("time_value") * F.lit(3.6)) > F.lit(self.MAX_SPEED_KMH))
         )
-        return (
-            df.withColumn(
-                "attribution",
-                F.when(is_overspeed, F.lit("drift")).otherwise(F.col("attribution")),
-            )
-            .drop("time_value", "dist_value")
-        )
+        return df.where(~is_overspeed).drop("time_value", "dist_value")
 
     def _fix_pingpong(self, df):
         """Detect longest A⇆B oscillation chains (min ABA) and merge each chain into one row."""
@@ -342,12 +336,15 @@ class HiveTable:
         # Step 3: handle ping-pong (detect and merge oscillation chains)
         result_df = self._fix_pingpong(result_df).orderBy("uid", "index_i")
 
-        # TODO: uncomment steps below when ready
-        # # Step 4: handle drift
-        # result_df = self._add_time_dist_columns(result_df)
-        # result_df = self._remove_drift(result_df)
+        # Step 4: drift removal loop (delete >600km/h, recalc, repeat until clean)
+        while True:
+            result_df = self._add_time_dist_columns(result_df)
+            before = result_df.count()
+            result_df = self._remove_drift(result_df).orderBy("uid", "index_i")
+            if result_df.count() == before:
+                break
 
-        # Final time/dist calculation (lag: saved in later row, first row = 0)
+        # Final time/dist calculation
         result_df = self._add_time_dist_columns(result_df)
 
         # Re-number idx from 1 per uid after processing
