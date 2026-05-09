@@ -1,47 +1,27 @@
 '''
-输入：dataset__YYYYMMDD（YYYYMMDD为日期，20230917-20230923和20250914-20250920），包含以下列：
+输入：dataset_multicity_YYYYMMDD（YYYYMMDD为日期，20230917-20230923和20250914-20250920），包含以下列：
 - uid: 用户唯一id
 - index: 轨迹点在用户轨迹中的索引，从0开始
 - stime: 轨迹点的时间戳
-- cid: 基站编号
 - lat: 轨迹点的纬度
 - lon: 轨迹点的经度
-- city: 轨迹点所属城市
-- province: 轨迹点所属省份
-- date: 轨迹点所属日期，格式为YYYYMMDD
 
-对dataset进行处理（dataset为原始数据）：
-1. 筛选跨城市用户（uid）及其轨迹记录
-2. 对筛选后的数据进行排序，按照uid分组，组内按照stime排序
-3. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
-漂移数据，乒乓数据处理：参考An adaptive staying point recognition algorithm based on spatiotemporal characteristics using cellular signaling data
+对dataset_multicity_YYYYMMDD进行处理：
+1. 漂移数据，乒乓数据处理：参考An adaptive staying point recognition algorithm based on spatiotemporal characteristics using cellular signaling data
 处理方法：
     · 删除重复记录（dropDuplicates）
     · 汇聚连续相同坐标记录（同一uid内连续相同lat/lon合并为一行，时间取平均）
     · 漂移数据：计算相邻记录速度，删除超过300km/h的超速记录
-    · 乒乓数据：检测基站切换回跳（A→B→A），用前后点平均坐标与时间替代
-4. 输出表格，形式为dataset_multicity_YYYYMMDD，包含以下列：
+    · 乒乓数据：检测基站切换回跳（A→B→A），用AB点平均坐标与时间替代
+2. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
+3. 输出表格，形式为dataset_multicity_YYYYMMDD，包含以下列：
 - uid: 用户唯一id
 - index: 轨迹点在用户轨迹中的索引，从0开始
 - stime: 轨迹点的时间戳
-- cid: 基站编号
 - lat: 轨迹点的纬度
 - lon: 轨迹点的经度
-- city: 轨迹点所属城市
-- province: 轨迹点所属省份
 - time_value: 与下一轨迹点的时间差（单位：秒），如果没有下一点则为0
 - dist_value: 与下一轨迹点的空间距离（单位：米），如果没有下一点则为0
-5. 对每个用户的time_value和dist_value进行统计，计算最大值、最小值、平均值和中位数，输出表格dataset_multicity_14days_stats，包含以下列：
-- stat_date: 统计日期，格式为YYYYMMDD
-- metric: 统计指标，取值为"time"，"distance"或"count"，分别表示时间差、空间距离和轨迹点数量
-- max_value: 统计指标的最大值
-- min_value: 统计指标的最小值
-- avg_value: 统计指标的平均值
-- median_value: 统计指标的中位数
-
-最后生成表有：14+1=15张，分别为：
-- dataset_multicity_YYYYMMDD（14张）
-- dataset_multicity_14days_stats（1张）
 '''
 
 from pyspark.sql import SparkSession
@@ -52,23 +32,7 @@ import traceback
 import os
 
 
-DEFAULT_DATES = [
-    "20230917"
-]
-''',
-    "20230918",
-    "20230919",
-    "20230920",
-    "20230921",
-    "20230922",
-    "20230923",
-    "20250914",
-    "20250915",
-    "20250916",
-    "20250917",
-    "20250918",
-    "20250919",
-    "20250920",'''
+DEFAULT_DATES = ["20230917"]
 
 class HiveTable:
     MAX_SPEED_MPS = 83.33          # 300 km/h
@@ -110,21 +74,6 @@ class HiveTable:
             if col_name in columns:
                 return col_name
         return None
-
-    @staticmethod
-    def parse_time_col(col_name="stime"):
-        s = F.trim(F.col(col_name).cast("string"))
-        ts_seconds = F.coalesce(
-            F.unix_timestamp(s, "yyyy/M/d H:mm"),
-            F.unix_timestamp(s, "yyyy/M/d HH:mm"),
-            F.unix_timestamp(s, "yyyy/M/d H:mm:ss"),
-            F.unix_timestamp(s, "yyyy/M/d HH:mm:ss"),
-            F.unix_timestamp(s, "yyyy-MM-dd HH:mm:ss"),
-            F.unix_timestamp(s, "yyyy-MM-dd HH:mm"),
-            F.unix_timestamp(s, "yyyy/MM/dd HH:mm:ss"),
-            F.unix_timestamp(s, "yyyy/MM/dd HH:mm"),
-        )
-        return F.from_unixtime(ts_seconds).cast("timestamp")
 
     def _table_exists(self, table_name):
         table_names = {
