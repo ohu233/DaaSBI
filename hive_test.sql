@@ -2,4 +2,4 @@
 
 SHOW tables;
 
-SELECT COUNT(*) FROM dataset_20230917;
+SELECT COUNT(*) FROM dataset_multicity_20230917;
