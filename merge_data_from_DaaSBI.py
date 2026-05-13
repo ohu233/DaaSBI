@@ -1,7 +1,7 @@
 import pandas as pd
 
-current_file = 'data/20230917/dataset_multicity_20230917_1.csv'
-append_file = 'data/20230917/dataset_multicity_20230917_2.csv'
+current_file = 'data/20230917/dataset_20230917_1.csv'
+append_file = 'data/20230917/dataset_20230917_2.csv'
 
 df1 = pd.read_csv(current_file, usecols=['index', 'stime', 'lat', 'lon'])
 df2 = pd.read_csv(append_file, usecols=['index', 'stime', 'lat', 'lon'])
@@ -23,6 +23,6 @@ for i in range(1, len(merged_df)):
 ordered_columns = ['uid', 'index', 'stime', 'lat', 'lon']
 merged_df = merged_df[ordered_columns]
 
-merged_df.to_csv('data/dataset_multicity_20230917.csv', index=False)
+merged_df.to_csv('data/dataset_20230917.csv', index=False)
 
 print(merged_df.head(10))

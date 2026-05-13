@@ -1,12 +1,12 @@
 '''
-输入：dataset_multicity_YYYYMMDD（YYYYMMDD为日期，20230917-20230923和20250914-20250920），包含以下列：
+输入：dataset_YYYYMMDD（YYYYMMDD为日期，20230917-20230923和20250914-20250920），包含以下列：
 - uid: 用户唯一id(eg: 1)
 - index: 轨迹点在用户轨迹中的索引，从0开始(eg: 1)
 - stime: 轨迹点的时间戳(eg: 1694951291)
 - lat: 轨迹点的纬度(eg: 31.946001)
 - lon: 轨迹点的经度(eg: 120.601)
 
-对dataset_multicity_YYYYMMDD进行处理：
+对dataset_YYYYMMDD进行处理：
 1. 乒乓数据，漂移数据处理：参考An adaptive staying point recognition algorithm based on spatiotemporal characteristics using cellular signaling data
 处理方法：
     · 删除重复记录（dropDuplicates）
@@ -14,8 +14,17 @@
     · 汇聚连续相同时间记录（同一uid内连续相同stime合并为一行，坐标取平均）
     · 乒乓数据：检测基站切换回跳（A→B→A...），用AB点平均坐标与时间替代，attribution标记为pingpong
     · 漂移数据：计算相邻记录速度，标记超过600km/h的超速记录，超速记录删除
+
 2. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
-3. 输出表格，形式为dataset_multicity_YYYYMMDD_processed，包含以下列：
+
+3. 筛选出南京到高淳、溧水的OD数据
+    · 根据经纬度筛选出经过南京高淳或溧水
+    - 南京：lat_min 31.88, lon_min 118.62, lat_max 32.15, lon_max 118.95
+    - 高淳：lat_min 31.23, lon_min 118.78, lat_max 31.43, lon_max 119.08
+    - 溧水：lat_min 31.39, lon_min 118.88, lat_max 31.70, lon_max 119.22
+
+5. 如果筛选后轨迹只有一个点，则丢弃
+4. 输出表格，形式为dataset_YYYYMMDD_NanJing_to_GaoChun_LiShui，包含以下列：
 - uid: 用户唯一id
 - index: 轨迹点在用户轨迹中的索引，从0开始
 - stime: 轨迹点的时间戳
@@ -23,7 +32,7 @@
 - lon: 轨迹点的经度
 - time_value: 与上一轨迹点的时间差（单位：秒），如果没有上一点则为0
 - dist_value: 与上一轨迹点的空间距离（单位：米），如果没有上一点则为0
-- velocity: 速度（单位：米/秒），time_value为0时填0
+- velocity: 速度（单位：千米/时），time_value为0时填0
 - attribution: 处理标记（origin/drift/pingpong）
 '''
 
@@ -55,6 +64,11 @@ class HiveTable:
     MAX_SPEED_KMH = 600            # 600 km/h drift threshold
     PINGPONG_TIME_THRESHOLD = 300  # seconds
 
+    # City bounding boxes for OD filtering
+    NANJING_BOX = dict(lat_min=31.88, lon_min=118.62, lat_max=32.15, lon_max=118.95)
+    GAOCHUN_BOX = dict(lat_min=31.23, lon_min=118.78, lat_max=31.43, lon_max=119.08)
+    LISHUI_BOX = dict(lat_min=31.39, lon_min=118.88, lat_max=31.70, lon_max=119.22)
+
     def __init__(self, db="ss_seu_df", local=False):
         builder = SparkSession.builder.enableHiveSupport()
 
@@ -62,7 +76,7 @@ class HiveTable:
             warehouse = f"file://{os.path.expanduser('~/hive/warehouse')}"
             builder = (
                 builder
-                .appName("preprocess_multicity")
+                .appName("filter_nanjing_od")
                 .master("local[*]")
                 .config("spark.hadoop.hive.metastore.uris", "thrift://localhost:9083")
                 .config("spark.sql.warehouse.dir", warehouse)
@@ -274,6 +288,39 @@ class HiveTable:
             .drop("_is_osc", "_orig_attr", "osc_grp")
         )
 
+    @staticmethod
+    def _in_city(lat_col, lon_col, box):
+        return (
+            (lat_col >= F.lit(box["lat_min"]))
+            & (lat_col <= F.lit(box["lat_max"]))
+            & (lon_col >= F.lit(box["lon_min"]))
+            & (lon_col <= F.lit(box["lon_max"]))
+        )
+
+    def _filter_nanjing_od(self, df):
+        """Keep only users who travel from Nanjing to Gaochun or Lishui."""
+        tagged = (
+            df
+            .withColumn("_in_nj", self._in_city(F.col("lat_d"), F.col("lon_d"), self.NANJING_BOX))
+            .withColumn("_in_gc", self._in_city(F.col("lat_d"), F.col("lon_d"), self.GAOCHUN_BOX))
+            .withColumn("_in_ls", self._in_city(F.col("lat_d"), F.col("lon_d"), self.LISHUI_BOX))
+        )
+
+        uid_has_city = (
+            tagged.groupBy("uid")
+            .agg(
+                F.max(F.col("_in_nj").cast("int")).alias("_has_nj"),
+                F.max((F.col("_in_gc") | F.col("_in_ls")).cast("int")).alias("_has_dest"),
+            )
+            .where(
+                (F.col("_has_nj") == 1)
+                & (F.col("_has_dest") == 1)
+            )
+        )
+
+        qualifying_uids = uid_has_city.select("uid")
+        return df.join(qualifying_uids, "uid", "inner")
+
     def _resolve_src_table(self, date_str, src_prefix="dataset"):
         candidates = [
             f"{src_prefix}_{date_str}",
@@ -360,6 +407,13 @@ class HiveTable:
             if result_df.count() == before:
                 break
 
+        # Step 5: filter Nanjing → Gaochun/Lishui OD
+        result_df = self._filter_nanjing_od(result_df)
+
+        # Step 6: drop users with only 1 trajectory point
+        uid_counts = result_df.groupBy("uid").count().where(F.col("count") >= 2).select("uid")
+        result_df = result_df.join(uid_counts, "uid", "inner")
+
         # Final time/dist calculation
         result_df = self._add_time_dist_columns(result_df)
 
@@ -386,11 +440,11 @@ class HiveTable:
     def _build_single_day_multicity_table(
         self,
         date_str,
-        src_prefix="dataset_multicity",
-        out_prefix="dataset_multicity",
+        src_prefix="dataset",
+        out_prefix="dataset",
     ):
         src_table = self._resolve_src_table(date_str=date_str, src_prefix=src_prefix)
-        out_table = f"{out_prefix}_{date_str}_processed"
+        out_table = f"{out_prefix}_{date_str}_NanJing_to_GaoChun_LiShui"
         detail_df = self._build_multicity_detail_df(src_table)
         detail_df.write.mode("overwrite").saveAsTable(out_table)
         print(f"Saved table: {out_table} rows={detail_df.count()}, from: {src_table}")
@@ -399,8 +453,8 @@ class HiveTable:
     def run_processing(
         self,
         date_list=None,
-        src_prefix="dataset_multicity",
-        out_prefix="dataset_multicity",
+        src_prefix="dataset",
+        out_prefix="dataset",
     ):
         if date_list is None:
             date_list = DEFAULT_DATES
@@ -431,8 +485,8 @@ if __name__ == "__main__":
     try:
         table.run_processing(
             date_list=DEFAULT_DATES,
-            src_prefix="dataset_multicity",
-            out_prefix="dataset_multicity",
+            src_prefix="dataset",
+            out_prefix="dataset",
         )
     finally:
         table.stop()
