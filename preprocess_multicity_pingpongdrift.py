@@ -33,7 +33,22 @@ import traceback
 import os
 
 
-DEFAULT_DATES = ["20230917"]
+DEFAULT_DATES = [
+    "20230917",
+    "20230918",
+    "20230919",
+    "20230920",
+    "20230921",
+    "20230922",
+    "20230923",
+    "20250914",
+    "20250915",
+    "20250916",
+    "20250917",
+    "20250918",
+    "20250919",
+    "20250920",
+]
 
 class HiveTable:
     MAX_SPEED_KMH = 600            # 600 km/h drift threshold
@@ -411,7 +426,7 @@ class HiveTable:
 
 if __name__ == "__main__":
     # Set local=True for local Hive testing; local=False (default) for YARN cluster
-    table = HiveTable(db="ss_seu_df", local=True)
+    table = HiveTable(db="ss_seu_df", local=False)
     try:
         table.run_processing(
             date_list=DEFAULT_DATES,
