@@ -351,11 +351,11 @@ class HiveTable:
         result_df = self._fix_pingpong(result_df)
 
         # Step 4: drift removal loop (delete >600km/h, recalc, repeat until clean)
-        result_df.cache()
+        result_df = result_df.localCheckpoint()
         while True:
-            result_df = self._add_time_dist_columns(result_df).cache()
+            result_df = self._add_time_dist_columns(result_df).localCheckpoint()
             before = result_df.count()
-            result_df = self._remove_drift(result_df).orderBy("uid", "index_i").cache()
+            result_df = self._remove_drift(result_df).orderBy("uid", "index_i").localCheckpoint()
             if result_df.count() == before:
                 break
 
