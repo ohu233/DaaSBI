@@ -323,7 +323,7 @@ class HiveTable:
         )
 
         # Step 1: drop duplicates
-        result_df = detail_df.dropDuplicates().orderBy("uid", "index_i")
+        result_df = detail_df.dropDuplicates()
 
         # Step 2: merge consecutive same-coordinate records
         result_df = (
@@ -334,7 +334,6 @@ class HiveTable:
                 .otherwise(F.lit("origin")),
             )
             .drop("_merge_cnt")
-            .orderBy("uid", "index_i")
         )
 
         # Step 2b: merge same-time records (avg coordinates)
@@ -346,17 +345,17 @@ class HiveTable:
                 .otherwise(F.col("attribution")),
             )
             .drop("_merge_time_cnt")
-            .orderBy("uid", "index_i")
         )
 
         # Step 3: handle ping-pong (detect and merge oscillation chains)
-        result_df = self._fix_pingpong(result_df).orderBy("uid", "index_i")
+        result_df = self._fix_pingpong(result_df)
 
         # Step 4: drift removal loop (delete >600km/h, recalc, repeat until clean)
+        result_df.cache()
         while True:
-            result_df = self._add_time_dist_columns(result_df)
+            result_df = self._add_time_dist_columns(result_df).cache()
             before = result_df.count()
-            result_df = self._remove_drift(result_df).orderBy("uid", "index_i")
+            result_df = self._remove_drift(result_df).orderBy("uid", "index_i").cache()
             if result_df.count() == before:
                 break
 
@@ -392,8 +391,9 @@ class HiveTable:
         src_table = self._resolve_src_table(date_str=date_str, src_prefix=src_prefix)
         out_table = f"{out_prefix}_{date_str}_processed"
         detail_df = self._build_multicity_detail_df(src_table)
+        row_count = detail_df.count()
         detail_df.write.mode("overwrite").saveAsTable(out_table)
-        print(f"Saved table: {out_table} rows={detail_df.count()}, from: {src_table}")
+        print(f"Saved table: {out_table} rows={row_count}, from: {src_table}")
         return out_table
 
     def run_processing(
