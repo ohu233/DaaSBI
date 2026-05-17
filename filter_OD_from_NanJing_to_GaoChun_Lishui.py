@@ -7,7 +7,12 @@
 - lon: 轨迹点的经度(eg: 120.601)
 
 对dataset_YYYYMMDD进行处理：
-1. 乒乓数据，漂移数据处理：参考An adaptive staying point recognition algorithm based on spatiotemporal characteristics using cellular signaling data
+1. 预筛选：先筛选南京到高淳、溧水的OD数据，大幅减少后续处理的数据量
+    - 南京：lat_min 31.88, lon_min 118.62, lat_max 32.15, lon_max 118.95
+    - 高淳：lat_min 31.23, lon_min 118.78, lat_max 31.43, lon_max 119.08
+    - 溧水：lat_min 31.39, lon_min 118.88, lat_max 31.70, lon_max 119.22
+
+2. 乒乓数据，漂移数据处理：参考An adaptive staying point recognition algorithm based on spatiotemporal characteristics using cellular signaling data
 处理方法：
     · 删除重复记录（dropDuplicates）
     · 汇聚连续相同坐标记录（同一uid内连续相同lat/lon合并为一行，时间取平均）
@@ -15,16 +20,13 @@
     · 乒乓数据：检测基站切换回跳（A→B→A...），用AB点平均坐标与时间替代，attribution标记为pingpong
     · 漂移数据：计算相邻记录速度，标记超过600km/h的超速记录，超速记录删除
 
-2. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
+3. 后筛选：merge/pingpong平均坐标后个别点可能偏移出范围，再次筛选
 
-3. 筛选出南京到高淳、溧水的OD数据
-    · 根据经纬度筛选出经过南京高淳或溧水
-    - 南京：lat_min 31.88, lon_min 118.62, lat_max 32.15, lon_max 118.95
-    - 高淳：lat_min 31.23, lon_min 118.78, lat_max 31.43, lon_max 119.08
-    - 溧水：lat_min 31.39, lon_min 118.88, lat_max 31.70, lon_max 119.22
+4. 如果筛选后轨迹只有一个点，则丢弃
 
-5. 如果筛选后轨迹只有一个点，则丢弃
-4. 输出表格，形式为dataset_YYYYMMDD_NanJing_to_GaoChun_LiShui，包含以下列：
+5. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
+
+6. 输出表格，形式为dataset_YYYYMMDD_NanJing_to_GaoChun_LiShui，包含以下列：
 - uid: 用户唯一id
 - index: 轨迹点在用户轨迹中的索引，从0开始
 - stime: 轨迹点的时间戳
@@ -369,8 +371,11 @@ class HiveTable:
             )
         )
 
+        # Pre-filter: keep only users in Nanjing & Gaochun/Lishui before expensive processing
+        result_df = self._filter_nanjing_od(detail_df)
+
         # Step 1: drop duplicates
-        result_df = detail_df.dropDuplicates()
+        result_df = result_df.dropDuplicates()
 
         # Step 2: merge consecutive same-coordinate records
         result_df = (
@@ -406,7 +411,7 @@ class HiveTable:
             if result_df.count() == before:
                 break
 
-        # Step 5: filter Nanjing → Gaochun/Lishui OD
+        # Step 5: post-filter (re-filter after merge/pingpong may shift coords out of target area)
         result_df = self._filter_nanjing_od(result_df)
 
         # Step 6: drop users with only 1 trajectory point
