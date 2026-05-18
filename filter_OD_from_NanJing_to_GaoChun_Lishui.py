@@ -300,28 +300,35 @@ class HiveTable:
         )
 
     def _filter_nanjing_od(self, df):
-        """Keep only users who travel from Nanjing to Gaochun or Lishui."""
+        """Keep users whose origin is in Nanjing and either:
+        - destination is in Gaochun/Lishui, or
+        - destination is also Nanjing but passed through Gaochun/Lishui (round trip)."""
         tagged = (
             df
             .withColumn("_in_nj", self._in_city(F.col("lat_d"), F.col("lon_d"), self.NANJING_BOX))
-            .withColumn("_in_gc", self._in_city(F.col("lat_d"), F.col("lon_d"), self.GAOCHUN_BOX))
-            .withColumn("_in_ls", self._in_city(F.col("lat_d"), F.col("lon_d"), self.LISHUI_BOX))
+            .withColumn(
+                "_in_dest",
+                self._in_city(F.col("lat_d"), F.col("lon_d"), self.GAOCHUN_BOX)
+                | self._in_city(F.col("lat_d"), F.col("lon_d"), self.LISHUI_BOX),
+            )
         )
 
-        uid_has_city = (
-            tagged.groupBy("uid")
-            .agg(
-                F.max(F.col("_in_nj").cast("int")).alias("_has_nj"),
-                F.max((F.col("_in_gc") | F.col("_in_ls")).cast("int")).alias("_has_dest"),
-            )
+        w = Window.partitionBy("uid").orderBy("index_i")
+        w_rev = Window.partitionBy("uid").orderBy(F.col("index_i").desc())
+        w_all = Window.partitionBy("uid")
+
+        return (
+            tagged
+            .withColumn("_first_in_nj", F.first("_in_nj").over(w))
+            .withColumn("_last_in_dest", F.first("_in_dest").over(w_rev))
+            .withColumn("_last_in_nj", F.first("_in_nj").over(w_rev))
+            .withColumn("_has_any_dest", F.max(F.col("_in_dest").cast("int")).over(w_all) == 1)
             .where(
-                (F.col("_has_nj") == 1)
-                & (F.col("_has_dest") == 1)
+                F.col("_first_in_nj")
+                & (F.col("_last_in_dest") | (F.col("_last_in_nj") & F.col("_has_any_dest")))
             )
+            .drop("_in_nj", "_in_dest", "_first_in_nj", "_last_in_dest", "_last_in_nj", "_has_any_dest")
         )
-
-        qualifying_uids = uid_has_city.select("uid")
-        return df.join(qualifying_uids, "uid", "inner")
 
     def _resolve_src_table(self, date_str, src_prefix="dataset"):
         candidates = [
