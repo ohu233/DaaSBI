@@ -9,8 +9,8 @@
 对dataset_YYYYMMDD进行处理：
 1. 预筛选：先筛选南京到高淳、溧水的OD数据，大幅减少后续处理的数据量
     - 南京：lat_min 31.88, lon_min 118.62, lat_max 32.15, lon_max 118.95
-    - 高淳：lat_min 31.23, lon_min 118.78, lat_max 31.43, lon_max 119.08
-    - 溧水：lat_min 31.39, lon_min 118.88, lat_max 31.70, lon_max 119.22
+    - 高淳：lat_min 31.22, lon_min 118.68, lat_max 31.43, lon_max 119.35
+    - 溧水：lat_min 31.38, lon_min 118.85, lat_max 31.80, lon_max 119.23
 
 2. 乒乓数据，漂移数据处理：参考An adaptive staying point recognition algorithm based on spatiotemporal characteristics using cellular signaling data
 处理方法：
@@ -67,9 +67,9 @@ class HiveTable:
     PINGPONG_TIME_THRESHOLD = 300  # seconds
 
     # City bounding boxes for OD filtering
-    NANJING_BOX = dict(lat_min=30.70, lon_min=118.00, lat_max=32.45, lon_max=119.25)
-    GAOCHUN_BOX = dict(lat_min=31.23, lon_min=118.78, lat_max=31.43, lon_max=119.08)
-    LISHUI_BOX = dict(lat_min=31.39, lon_min=118.88, lat_max=31.70, lon_max=119.22)
+    NANJING_BOX = dict(lat_min=31.88, lon_min=118.62, lat_max=32.15, lon_max=118.95)
+    GAOCHUN_BOX = dict(lat_min=31.22, lon_min=118.68, lat_max=31.43, lon_max=119.35)
+    LISHUI_BOX = dict(lat_min=31.38, lon_min=118.85, lat_max=31.80, lon_max=119.23)
 
     def __init__(self, db="ss_seu_df", local=False):
         builder = SparkSession.builder.enableHiveSupport()
