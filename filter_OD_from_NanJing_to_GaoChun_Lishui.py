@@ -46,10 +46,6 @@ import os
 
 
 DEFAULT_DATES = [
-    "20230917",
-    "20230918",
-    "20230919",
-    "20230920",
     "20230921",
     "20230922",
     "20230923",
@@ -313,21 +309,39 @@ class HiveTable:
             )
         )
 
-        w = Window.partitionBy("uid").orderBy("index_i")
-        w_rev = Window.partitionBy("uid").orderBy(F.col("index_i").desc())
-        w_all = Window.partitionBy("uid")
+        # Per-uid aggregates via groupBy: struct ordering extracts first/last row values
+        # by index_i without loading entire partitions into executor memory.
+        uid_agg = (
+            tagged
+            .groupBy("uid")
+            .agg(
+                F.min(F.struct("index_i", F.col("_in_nj"))).alias("_first_struct"),
+                F.max(F.struct("index_i", F.col("_in_dest"))).alias("_last_dest_struct"),
+                F.max(F.struct("index_i", F.col("_in_nj"))).alias("_last_nj_struct"),
+                F.max(F.col("_in_dest").cast("int")).alias("_has_any_dest"),
+            )
+            .select(
+                "uid",
+                F.col("_first_struct._in_nj").alias("_first_in_nj"),
+                F.col("_last_dest_struct._in_dest").alias("_last_in_dest"),
+                F.col("_last_nj_struct._in_nj").alias("_last_in_nj"),
+                F.col("_has_any_dest"),
+            )
+        )
+
+        qualifying_uids = (
+            uid_agg
+            .where(
+                F.col("_first_in_nj")
+                & (F.col("_last_in_dest") | (F.col("_last_in_nj") & (F.col("_has_any_dest") == 1)))
+            )
+            .select("uid")
+        )
 
         return (
             tagged
-            .withColumn("_first_in_nj", F.first("_in_nj").over(w))
-            .withColumn("_last_in_dest", F.first("_in_dest").over(w_rev))
-            .withColumn("_last_in_nj", F.first("_in_nj").over(w_rev))
-            .withColumn("_has_any_dest", F.max(F.col("_in_dest").cast("int")).over(w_all) == 1)
-            .where(
-                F.col("_first_in_nj")
-                & (F.col("_last_in_dest") | (F.col("_last_in_nj") & F.col("_has_any_dest")))
-            )
-            .drop("_in_nj", "_in_dest", "_first_in_nj", "_last_in_dest", "_last_in_nj", "_has_any_dest")
+            .join(qualifying_uids, "uid", "inner")
+            .drop("_in_nj", "_in_dest")
         )
 
     def _resolve_src_table(self, date_str, src_prefix="dataset"):
