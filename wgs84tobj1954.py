@@ -95,8 +95,8 @@ def process_excel(input_file, output_file):
 
 if __name__ == "__main__":
     # 输入和输出文件路径
-    input_csv = "dataset_multicity_20230917_processed.csv"  # 替换为您的输入文件路径
-    output_csv = "坐标转换后-" + input_csv  # 输出文件路径
-
-    # 执行处理
-    process_excel(input_csv, output_csv)
+    date = ['20230917', '20230923', '20250914', '20250920']
+    for i in range(len(date)):
+        input_csv = f"data\\Nanjing_GaochunLishui\\dataset_{date[i]}_nanjing_to_gaochun_lishui.csv"
+        output_csv = f"data\\Nanjing_GaochunLishui\\dataset_{date[i]}_nanjing_to_gaochun_lishui_with_grid.csv"
+        process_excel(input_csv, output_csv)

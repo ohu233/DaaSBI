@@ -7,8 +7,8 @@
 - lon: 轨迹点的经度(eg: 120.601)
 
 对dataset_YYYYMMDD进行处理：
-1. 预筛选：先筛选南京到高淳、溧水的OD数据，大幅减少后续处理的数据量
-    - 南京：lat_min 31.88, lon_min 118.62, lat_max 32.15, lon_max 118.95
+1. 预筛选：先筛选宣城到高淳、溧水的OD数据，大幅减少后续处理的数据量
+    - 宣城：lat_min 30.88, lon_min 118.62, lat_max 30.99, lon_max 118.78
     - 高淳：lat_min 31.22, lon_min 118.68, lat_max 31.43, lon_max 119.35
     - 溧水：lat_min 31.38, lon_min 118.85, lat_max 31.80, lon_max 119.23
 
@@ -26,7 +26,7 @@
 
 5. 计算相邻轨迹点之间的时间差和空间距离（使用haversine公式计算地理距离），保存在后一行的time_value和dist_value列中（每个uid第一行无差分）
 
-6. 输出表格，形式为dataset_YYYYMMDD_NanJing_to_GaoChun_LiShui，包含以下列：
+6. 输出表格，形式为dataset_YYYYMMDD_Xuancheng_to_GaoChun_LiShui，包含以下列：
 - uid: 用户唯一id
 - index: 轨迹点在用户轨迹中的索引，从0开始
 - stime: 轨迹点的时间戳
@@ -68,7 +68,7 @@ class HiveTable:
     PINGPONG_TIME_THRESHOLD = 300  # seconds
 
     # City bounding boxes for OD filtering
-    NANJING_BOX = dict(lat_min=31.88, lon_min=118.62, lat_max=32.15, lon_max=118.95)
+    Xuancheng_BOX = dict(lat_min=30.88, lon_min=118.62, lat_max=30.99, lon_max=118.78)
     GAOCHUN_BOX = dict(lat_min=31.22, lon_min=118.68, lat_max=31.43, lon_max=119.35)
     LISHUI_BOX = dict(lat_min=31.38, lon_min=118.85, lat_max=31.80, lon_max=119.23)
 
@@ -79,7 +79,7 @@ class HiveTable:
             warehouse = f"file://{os.path.expanduser('~/hive/warehouse')}"
             builder = (
                 builder
-                .appName("filter_nanjing_od")
+                .appName("filter_Xuancheng_od")
                 .master("local[*]")
                 .config("spark.hadoop.hive.metastore.uris", "thrift://localhost:9083")
                 .config("spark.sql.warehouse.dir", warehouse)
@@ -300,13 +300,13 @@ class HiveTable:
             & (lon_col <= F.lit(box["lon_max"]))
         )
 
-    def _filter_nanjing_od(self, df):
-        """Keep users whose origin is in Nanjing and either:
+    def _filter_Xuancheng_od(self, df):
+        """Keep users whose origin is in Xuancheng and either:
         - destination is in Gaochun/Lishui, or
-        - destination is also Nanjing but passed through Gaochun/Lishui (round trip)."""
+        - destination is also Xuancheng but passed through Gaochun/Lishui (round trip)."""
         tagged = (
             df
-            .withColumn("_in_nj", self._in_city(F.col("lat_d"), F.col("lon_d"), self.NANJING_BOX))
+            .withColumn("_in_nj", self._in_city(F.col("lat_d"), F.col("lon_d"), self.Xuancheng_BOX))
             .withColumn(
                 "_in_dest",
                 self._in_city(F.col("lat_d"), F.col("lon_d"), self.GAOCHUN_BOX)
@@ -397,8 +397,8 @@ class HiveTable:
             )
         )
 
-        # Pre-filter: keep only users in Nanjing & Gaochun/Lishui before expensive processing
-        result_df = self._filter_nanjing_od(detail_df)
+        # Pre-filter: keep only users in Xuancheng & Gaochun/Lishui before expensive processing
+        result_df = self._filter_Xuancheng_od(detail_df)
 
         # Step 1: drop duplicates
         result_df = result_df.dropDuplicates()
@@ -438,7 +438,7 @@ class HiveTable:
                 break
 
         # Step 5: post-filter (re-filter after merge/pingpong may shift coords out of target area)
-        result_df = self._filter_nanjing_od(result_df)
+        result_df = self._filter_Xuancheng_od(result_df)
 
         # Step 6: drop users with only 1 trajectory point
         uid_counts = result_df.groupBy("uid").count().where(F.col("count") >= 2).select("uid")
@@ -474,7 +474,7 @@ class HiveTable:
         out_prefix="dataset",
     ):
         src_table = self._resolve_src_table(date_str=date_str, src_prefix=src_prefix)
-        out_table = f"{out_prefix}_{date_str}_NanJing_to_GaoChun_LiShui"
+        out_table = f"{out_prefix}_{date_str}_Xuancheng_to_GaoChun_LiShui"
         detail_df = self._build_multicity_detail_df(src_table)
         row_count = detail_df.count()
         detail_df.write.mode("overwrite").saveAsTable(out_table)
