@@ -95,8 +95,8 @@ def process_excel(input_file, output_file):
 
 if __name__ == "__main__":
     # 输入和输出文件路径
-    date = ['20230917', '20230923', '20250914', '20250920']
+    date = ['20250914', '20250920']
     for i in range(len(date)):
-        input_csv = f"data\\Nanjing_GaochunLishui\\dataset_{date[i]}_nanjing_to_gaochun_lishui.csv"
-        output_csv = f"data\\Nanjing_GaochunLishui\\dataset_{date[i]}_nanjing_to_gaochun_lishui_with_grid.csv"
+        input_csv = f"data\\Xuancheng_GaochunLishui\\dataset_{date[i]}_xuancheng_to_gaochun_lishui.csv"
+        output_csv = f"data\\Xuancheng_GaochunLishui\\dataset_{date[i]}_xuancheng_to_gaochun_lishui_with_grid.csv"
         process_excel(input_csv, output_csv)
