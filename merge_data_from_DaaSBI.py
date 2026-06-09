@@ -1,6 +1,6 @@
 import pandas as pd
 
-date = '20250917'
+date = '20250920'
 current_file = f'data\\{date}\\dataset_multicity_{date}_processed_1.csv'
 append_file = f'data\\{date}\\dataset_multicity_{date}_processed_2.csv'
 
