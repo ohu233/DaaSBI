@@ -3,7 +3,7 @@
 
 流程:
   1. 加载推荐路线 (traj_labeled_filtered.csv)
-  2. 从 Hive 读取 with_stops 表,按 uid + index 取原始 hex 序列,去连续重复
+  2. 从 Hive 读取 with_stops 表,按 uid + index 取原始 hex 序列(保留全部信令点,不去重)
   3. 对推荐路线做 BUFFER_DIST 格缓冲区,计算原始信令点命中率
   4. 输出匹配结果表到 Hive
 
@@ -11,7 +11,7 @@
   spark-submit --master yarn --deploy-mode cluster \
     --driver-memory 8g --executor-memory 4g \
     --files traj_labeled_filtered.csv \
-    path_overlap_matching-buffer2.py
+    path_overlap_matching-buffer5.py
 """
 
 import csv
@@ -39,7 +39,7 @@ DATES = [
     "20250918", "20250919", "20250920",
 ]
 
-BUFFER_DIST = 2
+BUFFER_DIST = 5
 
 
 # ============================================================
@@ -68,46 +68,39 @@ def build_path_buffer(cells, offsets=HEX_BUFFER_OFFSETS):
 
 
 # ============================================================
-# 信令点去重 + 重叠度计算
+# 重叠度计算
 # ============================================================
 
-def dedup_consecutive(hex_sequence):
-    """去掉连续重复的 hex 格,保留首次出现。"""
-    if not hex_sequence:
-        return []
-    result = [hex_sequence[0]]
-    for h in hex_sequence[1:]:
-        if h != result[-1]:
-            result.append(h)
-    return result
-
-
-def buffered_overlap(signal_cells, reference_cells, reference_buffer=None,
+def buffered_overlap(signal_points, reference_points, reference_buffer=None,
                      buffer_dist=BUFFER_DIST):
-    """计算原始信令点落在推荐路线缓冲区内的占比。
+    """计算原始信令点(含重复)落在推荐路线缓冲区内的占比。
 
-    分母取 min(len(signal_cells), len(reference_cells)),
-    等价于 max(hit/|signal|, hit/|reference|)。
+    保留重复点参与计数:
+      hit_count   = 命中的信令点次数(含重复)
+      denominator = min(len(signal_points), len(reference_points))
+    缓冲区本身是空间区域(用 set 表示,用于"点是否在区域内"判定),
+    不属于对信令点去重。
     """
-    if not signal_cells or not reference_cells:
-        return 0, set(), 0.0
+    if not signal_points or not reference_points:
+        return 0, [], 0.0
 
-    if not isinstance(signal_cells, set):
-        signal_cells = set(signal_cells)
-    if not isinstance(reference_cells, set):
-        reference_cells = set(reference_cells)
+    if isinstance(signal_points, (set, frozenset)):
+        signal_points = list(signal_points)
+    if isinstance(reference_points, (set, frozenset)):
+        reference_points = list(reference_points)
 
     if reference_buffer is None:
+        ref_set = set(reference_points)
         if buffer_dist == BUFFER_DIST:
-            reference_buffer = build_path_buffer(reference_cells)
+            reference_buffer = build_path_buffer(ref_set)
         else:
             reference_buffer = build_path_buffer(
-                reference_cells, hex_buffer_offsets(buffer_dist)
+                ref_set, hex_buffer_offsets(buffer_dist)
             )
 
-    hit_cells = signal_cells & reference_buffer
+    hit_cells = [c for c in signal_points if c in reference_buffer]
     hit_count = len(hit_cells)
-    denominator = min(len(signal_cells), len(reference_cells))
+    denominator = min(len(signal_points), len(reference_points))
     overlap = min(hit_count, denominator) / denominator if denominator else 0.0
     return hit_count, hit_cells, overlap
 
@@ -125,11 +118,9 @@ def load_reference_routes(csv_path):
         for row in csv.DictReader(f):
             traj = json.loads(row["traj"])
             path = [tuple(p) for p in traj]
-            path_cells = set(path)
             routes.append({
                 "path": path,
-                "path_cells": path_cells,
-                "buffered": build_path_buffer(path_cells),
+                "buffered": build_path_buffer(set(path)),
                 "mode": row.get("mode", ""),
                 "travel_mode": row.get("travel_mode", ""),
                 "start_city": row.get("start_city", ""),
@@ -178,11 +169,10 @@ def process_date(spark, date_str, ref_routes, out_prefix="dataset"):
         print(f"  [{direction}] {len(trajectories)} 条轨迹")
 
         for uid, hex_seq in trajectories.items():
-            # 去连续重复,不做 A* 路径重建
-            deduped = dedup_consecutive(hex_seq)
-            if not deduped:
+            if not hex_seq:
                 continue
-            signal_cells = set(deduped)
+            # 保留原始全部信令点(按 index 时间顺序,不去重不降采样)
+            signal_cells_ordered = hex_seq
 
             best_ref_idx = -1
             best_overlap = -1.0
@@ -193,26 +183,31 @@ def process_date(spark, date_str, ref_routes, out_prefix="dataset"):
 
             for j, ref in enumerate(ref_routes):
                 hit_count, hit_cells, overlap = buffered_overlap(
-                    signal_cells,
-                    ref["path_cells"],
+                    signal_cells_ordered,
+                    ref["path"],
                     ref["buffered"],
                 )
                 if overlap > best_overlap:
                     best_overlap = overlap
                     best_ref_idx = j
                     best_hit_count = hit_count
-                    best_hit_cells = sorted(hit_cells)
+                    best_hit_cells = hit_cells
                     best_travel_mode = ref["travel_mode"]
                     best_mode = ref["mode"]
 
+            # 命中的信令点(按采集时间顺序,含重复)
             cells_str = ";".join(f"{x},{y},{z}" for x, y, z in best_hit_cells)
+            # 全部信令点(按 index 时间顺序,不去重不降采样)
+            signal_cells_str = ";".join(
+                f"{x},{y},{z}" for x, y, z in signal_cells_ordered
+            )
 
             all_results.append((
                 date_str, direction, uid,
                 best_ref_idx, best_travel_mode, best_mode,
-                len(hex_seq), len(deduped),
+                len(hex_seq),
                 best_hit_count, round(best_overlap, 4),
-                cells_str,
+                cells_str, signal_cells_str,
             ))
 
     return all_results
@@ -262,14 +257,14 @@ def main():
         StructField("travel_mode", StringType(), True),
         StructField("mode", StringType(), True),
         StructField("raw_points", IntegerType(), False),
-        StructField("deduped_len", IntegerType(), False),
         StructField("hit_count", IntegerType(), False),
         StructField("overlap", DoubleType(), False),
         StructField("hit_cells", StringType(), True),
+        StructField("signal_cells", StringType(), True),
     ])
     spark.createDataFrame(all_rows, schema=overlap_schema) \
-        .write.mode("overwrite").saveAsTable("path_overlap_results_buffer2_point")
-    print("  ✅ path_overlap_results_buffer2_point")
+        .write.mode("overwrite").saveAsTable("path_overlap_results_buffer5_calibration")
+    print("  ✅ path_overlap_results_buffer5_calibration")
 
     # 汇总
     print("\n汇总统计 ...")
@@ -279,7 +274,7 @@ def main():
                ROUND(AVG(overlap), 4) as avg_overlap,
                ROUND(MAX(overlap), 4) as max_overlap,
                ROUND(AVG(hit_count), 1) as avg_hit_cells
-        FROM path_overlap_results_buffer2_point        GROUP BY date, direction, travel_mode, best_ref_idx
+        FROM path_overlap_results_buffer5_calibration        GROUP BY date, direction, travel_mode, best_ref_idx
         ORDER BY date, direction, travel_mode
     """).show(50, False)
 
