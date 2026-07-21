@@ -21,7 +21,7 @@ from folium.plugins import HeatMap
 # 路径配置
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-att = '20250920_gte50'
+att = '20230923_strict_od_gte50'
 CSV_PATH = os.path.join(BASE_DIR, "data", f"signal_cell_counts_{att}.csv")
 PKL_PATH = os.path.join(BASE_DIR, "data", "nanjing_metro_hex_road_epsg2434.pkl")
 OUTPUT_HTML = os.path.join(BASE_DIR, f"freq_heatmap_{att}.html")
@@ -93,7 +93,7 @@ def main():
     # ---------- 2. 加载频次数据 ----------
     print("加载频次数据...", flush=True)
     freq_df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
-    top_pct = 0.1  # 保留频率最高的 top 10% 栅格
+    top_pct = 0.05  # 保留频率最高的 top 10% 栅格
     n = max(1, int(len(freq_df) * top_pct))
     freq_df = freq_df.nlargest(n, "pass_count")
     print(f"  记录数: {len(freq_df):,}", flush=True)
