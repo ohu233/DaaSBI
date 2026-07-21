@@ -21,9 +21,10 @@ from folium.plugins import HeatMap
 # 路径配置
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(BASE_DIR, "data", "20230917freqyzgcout.csv")
-PKL_PATH = os.path.join(BASE_DIR, "data", "hex_grid_NanJing.pkl")
-OUTPUT_HTML = os.path.join(BASE_DIR, "freq_heatmap_20230917.html")
+att = '20250920_gte50'
+CSV_PATH = os.path.join(BASE_DIR, "data", f"signal_cell_counts_{att}.csv")
+PKL_PATH = os.path.join(BASE_DIR, "data", "nanjing_metro_hex_road_epsg2434.pkl")
+OUTPUT_HTML = os.path.join(BASE_DIR, f"freq_heatmap_{att}.html")
 
 # ============================================================
 # WGS84 → GCJ-02 坐标偏移（高德瓦片使用 GCJ-02 坐标系）
@@ -92,11 +93,11 @@ def main():
     # ---------- 2. 加载频次数据 ----------
     print("加载频次数据...", flush=True)
     freq_df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
-    top_pct = 0.2  # 保留频率最高的 top 50% 栅格
+    top_pct = 0.1  # 保留频率最高的 top 10% 栅格
     n = max(1, int(len(freq_df) * top_pct))
-    freq_df = freq_df.nlargest(n, "frequency")
+    freq_df = freq_df.nlargest(n, "pass_count")
     print(f"  记录数: {len(freq_df):,}", flush=True)
-    print(f"  频次范围: [{freq_df['frequency'].min()}, {freq_df['frequency'].max()}]",
+    print(f"  频次范围: [{freq_df['pass_count'].min()}, {freq_df['pass_count'].max()}]",
           flush=True)
 
     # ---------- 3. 匹配经纬度 ----------
@@ -104,7 +105,7 @@ def main():
     missed = 0
 
     for _, row in freq_df.iterrows():
-        key = (int(row["locx"]), int(row["locy"]), int(row["locz"]))
+        key = (int(row["hex_x"]), int(row["hex_y"]), int(row["hex_z"]))
         info = grid.get(key)
         if info is None:
             missed += 1
@@ -113,7 +114,7 @@ def main():
         gcj_lon, gcj_lat = wgs84_to_gcj02(info["lon"], info["lat"])
         lons.append(gcj_lon)
         lats.append(gcj_lat)
-        frequencies.append(int(row["frequency"]))
+        frequencies.append(int(row["pass_count"]))
 
     print(f"  匹配成功: {len(lons):,}, 未命中: {missed:,}", flush=True)
 

@@ -3,7 +3,7 @@
 
 流程:
   1. 加载推荐路线 (traj_labeled_filtered.csv)
-  2. 从 Hive 读取 with_stops 表,按 uid + index 取原始 hex 序列(保留全部信令点,不去重)
+  2. 从 Hive 读取 with_stops 表,按 uid + index 取原始 hex 序列,去连续重复
   3. 对推荐路线做 BUFFER_DIST 格缓冲区,计算原始信令点命中率
   4. 输出匹配结果表到 Hive
 
@@ -68,39 +68,46 @@ def build_path_buffer(cells, offsets=HEX_BUFFER_OFFSETS):
 
 
 # ============================================================
-# 重叠度计算
+# 信令点去重 + 重叠度计算
 # ============================================================
 
-def buffered_overlap(signal_points, reference_points, reference_buffer=None,
+def dedup_consecutive(hex_sequence):
+    """去掉连续重复的 hex 格,保留首次出现。"""
+    if not hex_sequence:
+        return []
+    result = [hex_sequence[0]]
+    for h in hex_sequence[1:]:
+        if h != result[-1]:
+            result.append(h)
+    return result
+
+
+def buffered_overlap(signal_cells, reference_cells, reference_buffer=None,
                      buffer_dist=BUFFER_DIST):
-    """计算原始信令点(含重复)落在推荐路线缓冲区内的占比。
+    """计算原始信令点落在推荐路线缓冲区内的占比。
 
-    保留重复点参与计数:
-      hit_count   = 命中的信令点次数(含重复)
-      denominator = min(len(signal_points), len(reference_points))
-    缓冲区本身是空间区域(用 set 表示,用于"点是否在区域内"判定),
-    不属于对信令点去重。
+    分母取 min(len(signal_cells), len(reference_cells)),
+    等价于 max(hit/|signal|, hit/|reference|)。
     """
-    if not signal_points or not reference_points:
-        return 0, [], 0.0
+    if not signal_cells or not reference_cells:
+        return 0, set(), 0.0
 
-    if isinstance(signal_points, (set, frozenset)):
-        signal_points = list(signal_points)
-    if isinstance(reference_points, (set, frozenset)):
-        reference_points = list(reference_points)
+    if not isinstance(signal_cells, set):
+        signal_cells = set(signal_cells)
+    if not isinstance(reference_cells, set):
+        reference_cells = set(reference_cells)
 
     if reference_buffer is None:
-        ref_set = set(reference_points)
         if buffer_dist == BUFFER_DIST:
-            reference_buffer = build_path_buffer(ref_set)
+            reference_buffer = build_path_buffer(reference_cells)
         else:
             reference_buffer = build_path_buffer(
-                ref_set, hex_buffer_offsets(buffer_dist)
+                reference_cells, hex_buffer_offsets(buffer_dist)
             )
 
-    hit_cells = [c for c in signal_points if c in reference_buffer]
+    hit_cells = signal_cells & reference_buffer
     hit_count = len(hit_cells)
-    denominator = min(len(signal_points), len(reference_points))
+    denominator = min(len(signal_cells), len(reference_cells))
     overlap = min(hit_count, denominator) / denominator if denominator else 0.0
     return hit_count, hit_cells, overlap
 
@@ -118,9 +125,11 @@ def load_reference_routes(csv_path):
         for row in csv.DictReader(f):
             traj = json.loads(row["traj"])
             path = [tuple(p) for p in traj]
+            path_cells = set(path)
             routes.append({
                 "path": path,
-                "buffered": build_path_buffer(set(path)),
+                "path_cells": path_cells,
+                "buffered": build_path_buffer(path_cells),
                 "mode": row.get("mode", ""),
                 "travel_mode": row.get("travel_mode", ""),
                 "start_city": row.get("start_city", ""),
@@ -169,22 +178,24 @@ def process_date(spark, date_str, ref_routes, out_prefix="dataset"):
         print(f"  [{direction}] {len(trajectories)} 条轨迹")
 
         for uid, hex_seq in trajectories.items():
-            if not hex_seq:
+            # 去连续重复,不做 A* 路径重建;保留 index 时间顺序用于输出
+            deduped = dedup_consecutive(hex_seq)
+            if not deduped:
                 continue
-            # 保留原始全部信令点(按 index 时间顺序,不去重不降采样)
-            signal_cells_ordered = hex_seq
+            signal_cells_ordered = deduped          # 有序列表,按 index 时间顺序
+            signal_cells = set(deduped)              # 仅用于集合运算
 
             best_ref_idx = -1
             best_overlap = -1.0
             best_hit_count = 0
-            best_hit_cells = []
+            best_hit_cells = set()
             best_travel_mode = ""
             best_mode = ""
 
             for j, ref in enumerate(ref_routes):
                 hit_count, hit_cells, overlap = buffered_overlap(
-                    signal_cells_ordered,
-                    ref["path"],
+                    signal_cells,
+                    ref["path_cells"],
                     ref["buffered"],
                 )
                 if overlap > best_overlap:
@@ -195,9 +206,12 @@ def process_date(spark, date_str, ref_routes, out_prefix="dataset"):
                     best_travel_mode = ref["travel_mode"]
                     best_mode = ref["mode"]
 
-            # 命中的信令点(按采集时间顺序,含重复)
-            cells_str = ";".join(f"{x},{y},{z}" for x, y, z in best_hit_cells)
-            # 全部信令点(按 index 时间顺序,不去重不降采样)
+            # 按信令点采集时间顺序(index)输出命中的格
+            cells_str = ";".join(
+                f"{x},{y},{z}" for x, y, z in signal_cells_ordered
+                if (x, y, z) in best_hit_cells
+            )
+            # 全部信令点(去连续重复后,按 index 时间顺序),格式同 hit_cells
             signal_cells_str = ";".join(
                 f"{x},{y},{z}" for x, y, z in signal_cells_ordered
             )
@@ -205,7 +219,7 @@ def process_date(spark, date_str, ref_routes, out_prefix="dataset"):
             all_results.append((
                 date_str, direction, uid,
                 best_ref_idx, best_travel_mode, best_mode,
-                len(hex_seq),
+                len(hex_seq), len(deduped),
                 best_hit_count, round(best_overlap, 4),
                 cells_str, signal_cells_str,
             ))
@@ -257,6 +271,7 @@ def main():
         StructField("travel_mode", StringType(), True),
         StructField("mode", StringType(), True),
         StructField("raw_points", IntegerType(), False),
+        StructField("deduped_len", IntegerType(), False),
         StructField("hit_count", IntegerType(), False),
         StructField("overlap", DoubleType(), False),
         StructField("hit_cells", StringType(), True),
