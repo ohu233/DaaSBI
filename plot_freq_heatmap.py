@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 栅格频次热力图可视化
-以高德瓦片为底图，展示 20230917freq.csv 中各六边形栅格的通行频次
+以高德瓦片为底图，展示各六边形栅格的通行频次
 只对 CSV 中有频次数据的栅格做热力图扩散，不在表里的路网不绘制
+
+遍历 data/23cells 下所有 CSV，逐个生成热力图并输出到 heatmap 文件夹
 
 依赖: pip install folium pandas numpy
 """
 
+import glob
 import math
 import os
 import pickle
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -21,10 +25,12 @@ from folium.plugins import HeatMap
 # 路径配置
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-att = '20230923_strict_od_gte50'
-CSV_PATH = os.path.join(BASE_DIR, "data", f"signal_cell_counts_{att}.csv")
+INPUT_DIR = os.path.join(BASE_DIR, "data", "23cells")
 PKL_PATH = os.path.join(BASE_DIR, "data", "nanjing_metro_hex_road_epsg2434.pkl")
-OUTPUT_HTML = os.path.join(BASE_DIR, f"freq_heatmap_{att}.html")
+OUTPUT_DIR = os.path.join(BASE_DIR, "heatmap")
+
+# 星期标签：datetime.weekday() → 周一..周日
+WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 # ============================================================
 # WGS84 → GCJ-02 坐标偏移（高德瓦片使用 GCJ-02 坐标系）
@@ -81,26 +87,29 @@ def wgs84_to_gcj02(lon, lat):
 
 
 # ============================================================
-# 主流程
+# 单个 CSV 的热力图绘制
 # ============================================================
-def main():
-    # ---------- 1. 加载栅格字典 ----------
-    print("加载栅格文件...", flush=True)
-    with open(PKL_PATH, "rb") as f:
-        grid = pickle.load(f)
-    print(f"  栅格总数: {len(grid):,}", flush=True)
+def plot_heatmap(csv_path, output_html, grid, top_pct=0.05):
+    """对单个频次 CSV 生成热力图 HTML
 
-    # ---------- 2. 加载频次数据 ----------
-    print("加载频次数据...", flush=True)
-    freq_df = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
-    top_pct = 0.05  # 保留频率最高的 top 10% 栅格
+    Args:
+        csv_path:    输入 CSV 路径
+        output_html: 输出 HTML 路径
+        grid:        栅格字典 {(hex_x, hex_y, hex_z): {"lon", "lat", ...}}
+        top_pct:     保留频率最高的 top 比例（默认 5%）
+    """
+    name = os.path.basename(csv_path)
+    print(f"\n=== 处理 {name} ===", flush=True)
+
+    # ---------- 1. 加载频次数据 ----------
+    freq_df = pd.read_csv(csv_path, encoding="utf-8-sig")
     n = max(1, int(len(freq_df) * top_pct))
     freq_df = freq_df.nlargest(n, "pass_count")
-    print(f"  记录数: {len(freq_df):,}", flush=True)
+    print(f"  记录数(top {top_pct:.0%}): {len(freq_df):,}", flush=True)
     print(f"  频次范围: [{freq_df['pass_count'].min()}, {freq_df['pass_count'].max()}]",
           flush=True)
 
-    # ---------- 3. 匹配经纬度 ----------
+    # ---------- 2. 匹配经纬度 ----------
     lons, lats, frequencies = [], [], []
     missed = 0
 
@@ -119,10 +128,10 @@ def main():
     print(f"  匹配成功: {len(lons):,}, 未命中: {missed:,}", flush=True)
 
     if not lons:
-        print("错误: 没有匹配到任何栅格，请检查数据一致性")
+        print(f"  警告: 没有匹配到任何栅格，跳过 {name}")
         return
 
-    # ---------- 4. 计算中心点和自适应缩放 ----------
+    # ---------- 3. 计算中心点和自适应缩放 ----------
     center_lat = np.mean(lats)
     center_lon = np.mean(lons)
 
@@ -141,7 +150,7 @@ def main():
 
     print(f"  地图中心: ({center_lat:.4f}, {center_lon:.4f}), zoom={zoom}", flush=True)
 
-    # ---------- 5. 构建热力图数据 ----------
+    # ---------- 4. 构建热力图数据 ----------
     freq_arr = np.array(frequencies, dtype=np.float64)
     # 对数归一化：压缩低频，拉开高频，让廊道更突出
     log_freq = np.log1p(freq_arr)
@@ -158,9 +167,7 @@ def main():
         if norm_freq[i] > 0
     ]
 
-    # ---------- 6. 创建 folium 地图 ----------
-    print("生成热力图...", flush=True)
-
+    # ---------- 5. 创建 folium 地图 ----------
     m = folium.Map(
         location=[center_lat, center_lon],
         zoom_start=zoom,
@@ -214,25 +221,58 @@ def main():
         },
     ).add_to(m)
 
-    # ---------- 标注关键地点 ----------
-    # 高淳老街 WGS84 大约 (118.891, 31.327)，转 GCJ-02 后标注
-    gcj_gcj_lj_lon, gcj_gcj_lj_lat = wgs84_to_gcj02(118.891, 31.327)
-    folium.Marker(
-        location=[gcj_gcj_lj_lat, gcj_gcj_lj_lon],
-        popup="高淳老街",
-        tooltip="高淳老街",
-        icon=folium.Icon(color="red", icon="info-sign"),
-    ).add_to(m)
-
     # 图层控制开关
     folium.LayerControl().add_to(m)
 
-    # ---------- 7. 保存 ----------
-    m.save(OUTPUT_HTML)
-    print(f"\n热力图已保存: {OUTPUT_HTML}", flush=True)
-    print(f"  有效栅格: {len(heat_data):,}", flush=True)
-    print(f"  频次最大值: {int(freq_arr.max()):,}", flush=True)
-    print(f"  频次中位数: {int(np.median(freq_arr)):,}", flush=True)
+    # ---------- 6. 保存 ----------
+    m.save(output_html)
+    print(f"  已保存: {output_html}", flush=True)
+    print(f"  有效栅格: {len(heat_data):,}, 频次最大值: {int(freq_arr.max()):,}", flush=True)
+
+
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    # ---------- 1. 加载栅格字典（只加载一次） ----------
+    print("加载栅格文件...", flush=True)
+    with open(PKL_PATH, "rb") as f:
+        grid = pickle.load(f)
+    print(f"  栅格总数: {len(grid):,}", flush=True)
+
+    # ---------- 2. 收集输入 CSV ----------
+    csv_files = sorted(glob.glob(os.path.join(INPUT_DIR, "signal_cell_counts_*.csv")))
+    if not csv_files:
+        print(f"错误: 在 {INPUT_DIR} 下未找到任何 CSV 文件")
+        return
+    print(f"\n共发现 {len(csv_files)} 个 CSV 文件", flush=True)
+
+    # ---------- 3. 准备输出目录 ----------
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # ---------- 4. 逐个生成热力图 ----------
+    for i, csv_path in enumerate(csv_files, 1):
+        # 文件名形如 signal_cell_counts_<YYYYMMDD>_<att>.csv
+        stem = os.path.splitext(os.path.basename(csv_path))[0]
+        att = stem.replace("signal_cell_counts_", "", 1)
+        # att 形如 20230917_strict_od_gte50 → 解析日期得到星期几
+        date_str = att[:8]
+        try:
+            weekday = WEEKDAY_CN[datetime.strptime(date_str, "%Y%m%d").weekday()]
+        except ValueError:
+            weekday = "未知"
+        output_html = os.path.join(
+            OUTPUT_DIR, f"freq_heatmap_{att}_{weekday}.html"
+        )
+
+        print(f"\n[{i}/{len(csv_files)}] 处理中...", flush=True)
+        try:
+            plot_heatmap(csv_path, output_html, grid)
+        except Exception as e:
+            print(f"  失败: {e}", flush=True)
+            continue
+
+    print(f"\n全部完成，输出目录: {OUTPUT_DIR}", flush=True)
     print("请在浏览器中打开 HTML 文件查看", flush=True)
 
 
